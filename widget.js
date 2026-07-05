@@ -1,0 +1,4145 @@
+(function () {
+
+  // ── Config ────────────────────────────────────────────
+  // NOTE: BACKEND_URL intentionally left pointing at the existing live
+  // onrender.com host — renaming a live deployed URL is an infra/DNS
+  // decision, not a text find-and-replace. Flagged for follow-up, not changed here.
+  const BACKEND_URL = "https://agentflow-backend-krdb.onrender.com";
+  const API_KEY  = document.currentScript?.getAttribute("data-api-key") || "";
+  if (!API_KEY) {
+    // No silent fallback to someone else's key. Show a visible, unmistakable
+    // configuration error instead and stop initializing the widget.
+    const errBox = document.createElement("div");
+    errBox.setAttribute("id", "af-config-error");
+    errBox.style.cssText =
+      "position:fixed;bottom:20px;right:20px;z-index:999999;max-width:320px;" +
+      "background:#fff3f3;border:1px solid #e0a0a0;color:#7a1515;" +
+      "font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;" +
+      "padding:12px 14px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.15);";
+    errBox.innerHTML =
+      "<strong>Liontech Support Bot &mdash; configuration error</strong><br>" +
+      "Missing <code>data-api-key</code> attribute on the widget's " +
+      "<code>&lt;script&gt;</code> tag. The assistant cannot start.";
+    if (document.body) {
+      document.body.appendChild(errBox);
+    } else {
+      document.addEventListener("DOMContentLoaded", () => document.body.appendChild(errBox));
+    }
+    return; // Stop here — do not initialize the rest of the widget.
+  }
+  const THEME    = document.currentScript?.getAttribute("data-theme")   || "blue";
+
+  // ── MVP feature flags ──────────────────────────────────
+  // Off by default for MVP launch. The underlying code for each of these
+  // stays in the file — nothing is deleted — these flags just keep them
+  // out of the default UI/behavior. Flip to true (or wire up a per-client
+  // config the way siteCrawlerEnabled is wired, if you want this
+  // per-client rather than global) to re-enable.
+  const MVP_FEATURES = {
+    commandPalette:    false,  // Ctrl+K / Cmd+K quick-command palette
+    walkthroughMode:   false,  // Guided Walkthrough step-tracker UI
+    voiceNotes:        false,  // Mic button + voice-note recording
+    shareConversation: false   // "Copy transcript" button in history list
+  };
+  // Optional: host page can declare the logged-in user's ERP role, e.g.
+  // <script ... data-user-role="Accounts Clerk"></script>. Sent with every
+  // message so the AI can avoid suggesting actions outside that role.
+  const USER_ROLE = document.currentScript?.getAttribute("data-user-role") || "";
+
+  const THEMES = {
+    blue:  { primary: "#0052cc", light: "#e8f0fe", accent: "#003d99" },
+    green: { primary: "#27ae60", light: "#e8f5e9", accent: "#219150" },
+    dark:  { primary: "#1a1a2e", light: "#f0f0f0", accent: "#16213e" },
+    red: { primary: "#9B1B1B", light: "#fdf0f0", accent: "#7a1515" }
+  };
+  const theme = THEMES[THEME] || THEMES.blue;
+  // ── Modern Icon Set ──────────────────────────────────
+  const ICONS = {
+    file: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>`,
+    image: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1.2em;height:1.2em;"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>`,
+    trash: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1em;height:1em;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`,
+    download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1.1em;height:1.1em;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>`,
+    send: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1.1em;height:1.1em;"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`,
+    mic: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:1.1em;height:1.1em;"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>`
+  };
+
+  // ── State ─────────────────────────────────────────────
+  let clientInfo          = null;
+  let isProcessing        = false;
+  let pendingPlan         = null;
+  let conversationHistory = [];
+  let attachments         = [];   // [{ name, type, size, dataUrl, text }]
+  const SESSION_KEY       = "af_conv_" + (API_KEY || "default");
+
+  // ── Bot active state — set from /api/agent/status poll ───────────────────
+  // true  = bot is live, input enabled
+  // false = admin turned bot off, input blocked, offline banner shown
+  let botActive = true;
+
+  // ── Authenticated user state ──────────────────────────
+  // Set after login; used to send Bearer token in all API requests
+  let widgetToken = null;
+  let widgetUser  = null;
+  let widgetOrg   = null;
+
+  // ── Auth headers helper ───────────────────────────────
+  // When logged in via JWT, sends Bearer token.
+  // Falls back to x-api-key for backward compat (direct embed without login).
+  function authHeaders(extra) {
+    const h = { "ngrok-skip-browser-warning": "true", ...(extra || {}) };
+    if (widgetToken) {
+      h["Authorization"] = "Bearer " + widgetToken;
+    } else {
+      h["x-api-key"] = API_KEY;
+    }
+    return h;
+  }
+
+
+
+  // ── Network / connection state ────────────────────────
+  // 'ok' | 'slow' | 'offline'
+  let networkStatus   = "ok";
+  let offlineQueue    = [];   // messages buffered while offline
+  let _lastOnlineAt   = Date.now();
+
+  // ── Device fingerprint ────────────────────────────────
+  const deviceInfo = (function () {
+    const ua = navigator.userAgent;
+    let os = "Unknown OS";
+    if (/Windows NT 10/.test(ua))     os = "Windows 10/11";
+    else if (/Windows NT 6/.test(ua)) os = "Windows 7/8";
+    else if (/Mac OS X/.test(ua))     os = "macOS";
+    else if (/Linux/.test(ua))        os = "Linux";
+    else if (/Android/.test(ua))      os = "Android";
+    else if (/iPhone|iPad/.test(ua))  os = "iOS";
+    let browser = "Unknown Browser";
+    if (/Edg\//.test(ua))            browser = "Microsoft Edge";
+    else if (/Chrome\//.test(ua))    browser = "Chrome";
+    else if (/Firefox\//.test(ua))   browser = "Firefox";
+    else if (/Safari\//.test(ua))    browser = "Safari";
+
+    const fingerprint = [
+    ua,
+    navigator.language,
+    screen.width + "x" + screen.height,
+    Intl.DateTimeFormat().resolvedOptions().timeZone
+  ].join("|");
+  
+  // Simple hash function for the ID
+  const deviceId = btoa(fingerprint).slice(0, 32);
+
+     return {
+      deviceId,
+      os, browser,
+      screenRes: screen.width + "x" + screen.height,
+      timezone:  Intl.DateTimeFormat().resolvedOptions().timeZone,
+      language:  navigator.language || "en",
+      userAgent: ua.slice(0, 120)
+    };
+  }());
+
+  // ── Operator detection ────────────────────────────────
+  function detectOperator() {
+    var selectors = [
+      ".user-name","#user-name",".username","#username",
+      ".user-card .user-name",".sidebar-footer .user-name",
+      "[data-username]","[data-user]",
+      ".nav-user",".header-user",".profile-name",
+      ".operator-name",".staff-name",".agent-name",
+      ".avatar-name",".display-name",".full-name",
+      ".topbar .name","header .name"
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      try {
+        var el = document.querySelector(selectors[i]);
+        if (el) {
+          var text = (el.getAttribute("data-username") || el.getAttribute("data-user") || el.textContent || "").trim();
+          if (text && text.length > 1 && text.length < 60) return text;
+        }
+      } catch (e) {}
+    }
+    var namePattern = /^[A-Z][a-z]+ [A-Z][a-z]+$/;
+    var candidates  = document.querySelectorAll(".user-card *, .profile *, .topbar *");
+    for (var j = 0; j < candidates.length; j++) {
+      var t = (candidates[j].textContent || "").trim();
+      if (namePattern.test(t)) return t;
+    }
+    return null;
+  }
+
+  // ── Styles ────────────────────────────────────────────
+  const style = document.createElement("style");
+  style.textContent = `
+    * { box-sizing: border-box; }
+
+    #af-launcher {
+      position: fixed; bottom: 30px; right: 30px;
+      width: 58px; height: 58px;
+      background: ${theme.primary};
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 4px 24px ${theme.primary}55;
+      z-index: 9999; border: none;
+      /* No transition here — children handle their own */
+    }
+    #af-launcher:hover { box-shadow: 0 6px 28px ${theme.primary}77; }
+
+    /* The launcher holds two icon layers that cross-fade */
+    #af-launcher .af-icon-logo,
+    #af-launcher .af-icon-close {
+      position: absolute;
+      display: flex; align-items: center; justify-content: center;
+      width: 36px; height: 36px;
+      transition: opacity 0.25s ease, transform 0.35s cubic-bezier(0.34,1.56,0.64,1);
+      pointer-events: none;
+    }
+
+    /* Default state: logo visible, X hidden+rotated */
+    #af-launcher .af-icon-logo  { opacity: 1; transform: rotate(0deg) scale(1); }
+    #af-launcher .af-icon-close { opacity: 0; transform: rotate(-90deg) scale(0.6); }
+
+    /* Open state: logo hidden+rotated, X visible */
+    #af-launcher.open .af-icon-logo  { opacity: 0; transform: rotate(90deg) scale(0.6); }
+    #af-launcher.open .af-icon-close { opacity: 1; transform: rotate(0deg) scale(1); }
+
+    /* Subtle scale pulse on the button itself */
+    #af-launcher { transition: box-shadow 0.2s, transform 0.2s; }
+    #af-launcher:hover { transform: scale(1.08); }
+
+    #af-panel {
+      position: fixed; bottom: 106px; right: 30px; top: 16px;
+      width: 420px; background: #fff; border-radius: 18px;
+      box-shadow: 0 12px 56px rgba(0,0,0,0.16); z-index: 9998;
+      display: none; flex-direction: column; overflow: hidden;
+      border: 1px solid #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+      animation: af-up 0.22s ease; max-height: calc(100vh - 130px);
+      min-width: 320px; min-height: 380px;
+    }
+    @keyframes af-up { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:translateY(0); } }
+    #af-panel.open { display: flex; }
+    #af-panel.af-resizing { animation: none; user-select: none; }
+
+    /* ── Full screen mode ── */
+    #af-panel.af-fullscreen {
+      top: 16px !important; left: 16px !important; right: 16px !important; bottom: 16px !important;
+      width: auto !important; height: auto !important; max-height: none !important;
+      border-radius: 12px;
+    }
+
+    /* ── Resize handle (top-left corner grip) ── */
+    .af-resize-handle {
+      position: absolute; top: 0; left: 0; width: 18px; height: 18px;
+      cursor: nwse-resize; z-index: 50; touch-action: none;
+    }
+    .af-resize-handle::before {
+      content: ""; position: absolute; top: 6px; left: 6px; width: 7px; height: 7px;
+      border-left: 2px solid rgba(255,255,255,0.65); border-top: 2px solid rgba(255,255,255,0.65);
+      border-radius: 2px 0 0 0;
+    }
+    #af-panel.af-fullscreen .af-resize-handle { display: none; }
+
+    #af-fullscreen-btn {
+      background: none; border: none; color: white; opacity: 0.85; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; padding: 2px;
+    }
+    #af-fullscreen-btn:hover { opacity: 1; }
+
+    #af-explain-page-btn {
+      background: none; border: none; color: white; opacity: 0.85; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; padding: 2px;
+    }
+    #af-explain-page-btn:hover { opacity: 1; }
+    #af-explain-page-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    #af-history-btn {
+      background: none; border: none; color: white; opacity: 0.85; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; padding: 2px;
+    }
+    #af-history-btn:hover { opacity: 1; }
+
+    /* ── Conversation history panel (slides over the message list) ── */
+    #af-history-panel {
+      position: absolute; inset: 0; background: #fff; z-index: 40;
+      display: none; flex-direction: column;
+    }
+    #af-history-panel.open { display: flex; }
+    #af-history-head {
+      display: flex; align-items: center; gap: 8px; padding: 12px 14px;
+      border-bottom: 1px solid #eee;
+    }
+    #af-history-search {
+      flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none;
+    }
+    #af-history-close, #af-history-new {
+      background: none; border: none; cursor: pointer; font-size: 13px; color: #234; padding: 4px 6px;
+    }
+    #af-history-list { flex: 1; overflow-y: auto; padding: 6px 10px; }
+    .af-hist-item {
+      display: flex; align-items: center; gap: 8px; padding: 10px 8px; border-radius: 8px;
+      cursor: pointer; border-bottom: 1px solid #f2f2f2;
+    }
+    .af-hist-item:hover { background: #f7f9fc; }
+    .af-hist-title { flex: 1; font-size: 13px; color: #222; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .af-hist-time  { font-size: 11px; color: #999; white-space: nowrap; }
+    .af-hist-btn   { background: none; border: none; cursor: pointer; font-size: 13px; opacity: 0.6; padding: 2px 4px; }
+    .af-hist-btn:hover { opacity: 1; }
+    .af-hist-empty { padding: 30px 16px; text-align: center; color: #999; font-size: 13px; }
+
+    /* ── Guided Walkthrough ── */
+    .af-wt-overview { margin: 8px 0 0 18px; padding: 0; font-size: 13px; }
+    .af-wt-overview li { margin-bottom: 3px; }
+    #af-wt-banner {
+      position: absolute; left: 12px; right: 12px; bottom: 84px; z-index: 45;
+      background: #1a1a2e; color: #fff; border-radius: 12px; padding: 12px 14px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    }
+    .af-wt-progress { font-size: 11px; opacity: 0.7; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+    .af-wt-instruction { font-size: 13.5px; line-height: 1.4; margin-bottom: 10px; }
+    .af-wt-controls { display: flex; justify-content: flex-end; gap: 8px; }
+    .af-wt-btn { border: none; border-radius: 8px; padding: 7px 14px; font-size: 12.5px; cursor: pointer; }
+    .af-wt-exit { background: rgba(255,255,255,0.12); color: #fff; }
+    .af-wt-exit:hover { background: rgba(255,255,255,0.2); }
+    .af-wt-next { background: #f57f17; color: #fff; font-weight: 600; }
+    .af-wt-next:hover { background: #e07000; }
+    .af-wt-done { font-size: 13.5px; text-align: center; padding: 4px 0; }
+
+    #af-header {
+      background: ${theme.primary}; color: white; padding: 14px 16px;
+      display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+    }
+    .af-hinfo .af-title { font-size: 14px; font-weight: 700; }
+    .af-hinfo .af-sub   { font-size: 11px; opacity: 0.72; margin-top: 2px; }
+    .af-hright { display: flex; align-items: center; gap: 10px; }
+    /* ── Network status banner ── */
+    #af-net-banner {
+      display: none; align-items: center; gap: 8px;
+      padding: 7px 14px; font-size: 12px; font-weight: 600;
+      flex-shrink: 0; border-bottom: 1px solid transparent;
+      transition: background 0.3s, color 0.3s;
+    }
+    #af-net-banner.visible { display: flex; }
+    #af-net-banner.offline { background: #fdecea; color: #b71c1c; border-color: #ffcdd2; }
+    #af-net-banner.slow    { background: #fff8e1; color: #e65100; border-color: #ffe082; }
+    #af-net-banner .af-nb-icon { font-size: 14px; flex-shrink: 0; }
+    #af-net-banner .af-nb-msg  { flex: 1; }
+    #af-net-banner .af-nb-retry {
+      font-size: 11px; text-decoration: underline; cursor: pointer;
+      background: none; border: none; color: inherit; padding: 0;
+    }
+
+    /* ── Dot colours by network status ── */
+    .af-dot          { width: 7px; height: 7px; border-radius: 50%; background: #00FF88; animation: af-pulse 2s infinite; }
+    .af-dot.slow     { background: #FFB300; }
+    .af-dot.offline  { background: #f44336; animation: none; }
+    .af-dot.bot-offline { background: #f44336; animation: none; }
+    @keyframes af-pulse { 0%,100%{opacity:1}50%{opacity:0.35} }
+    /* ── Bot-offline overlay ── */
+    #af-bot-offline-banner {
+      display: none; align-items: center; gap: 8px;
+      padding: 8px 14px; font-size: 12px; font-weight: 600;
+      background: #fdecea; color: #b71c1c;
+      border-bottom: 1px solid #ffcdd2; flex-shrink: 0;
+    }
+    #af-bot-offline-banner.visible { display: flex; }
+
+    /* ══ Auth screen ══════════════════════════════════════
+       Shown before the chat. Covers the full panel.
+       States: login | signup | forgot
+    ══════════════════════════════════════════════════════ */
+    #af-auth-screen {
+      display: flex; flex-direction: column;
+      position: absolute; inset: 0; z-index: 30;
+      background: #f7f8fa; border-radius: 16px; overflow-y: auto;
+    }
+    #af-auth-screen.hidden { display: none; }
+
+    .af-auth-header {
+      background: ${theme.primary}; color: white;
+      padding: 18px 20px 16px; flex-shrink: 0;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .af-auth-logo {
+      width: 32px; height: 32px; border-radius: 50%;
+      object-fit: contain; background: rgba(255,255,255,0.15);
+    }
+    .af-auth-header-text { flex: 1; }
+    .af-auth-header-title { font-size: 14px; font-weight: 700; }
+    .af-auth-header-sub   { font-size: 11px; opacity: 0.8; margin-top: 2px; }
+
+    .af-auth-body {
+      flex: 1; padding: 24px 20px 20px;
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .af-auth-title {
+      font-size: 18px; font-weight: 800; color: #111; margin: 0 0 2px;
+    }
+    .af-auth-subtitle { font-size: 12px; color: #888; margin: 0 0 4px; }
+
+    .af-auth-field { display: flex; flex-direction: column; gap: 5px; }
+    .af-auth-field label {
+      font-size: 11px; font-weight: 700; color: #555;
+      display: flex; align-items: center; gap: 5px; letter-spacing: 0.3px;
+    }
+    .af-auth-field label svg { opacity: 0.6; }
+    .af-auth-field input {
+      padding: 9px 12px; border: 1.5px solid #e0e0e0; border-radius: 8px;
+      font-size: 13px; outline: none; background: white; color: #111;
+      transition: border-color 0.2s;
+    }
+    .af-auth-field input:focus { border-color: ${theme.primary}; }
+    .af-auth-field input.error { border-color: #e53935; }
+
+    .af-auth-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+    .af-auth-btn {
+      padding: 11px; background: ${theme.primary}; color: white;
+      border: none; border-radius: 9px; font-size: 13px; font-weight: 700;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      gap: 7px; transition: background 0.2s; margin-top: 4px;
+    }
+    .af-auth-btn:hover  { background: ${theme.accent}; }
+    .af-auth-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .af-auth-switch {
+      text-align: center; font-size: 12px; color: #888; margin-top: 2px;
+    }
+    .af-auth-switch a {
+      color: ${theme.primary}; font-weight: 700; cursor: pointer;
+      text-decoration: none;
+    }
+    .af-auth-switch a:hover { text-decoration: underline; }
+
+    .af-auth-error {
+      background: #fdecea; color: #b71c1c; border: 1px solid #ffcdd2;
+      border-radius: 8px; padding: 9px 12px; font-size: 12px;
+      display: none; align-items: center; gap: 7px;
+    }
+    .af-auth-error.visible { display: flex; }
+
+    .af-auth-success {
+      background: #e8f5e9; color: #1b5e20; border: 1px solid #c8e6c9;
+      border-radius: 8px; padding: 9px 12px; font-size: 12px;
+      display: none; align-items: center; gap: 7px;
+    }
+    .af-auth-success.visible { display: flex; }
+
+    .af-auth-divider {
+      display: flex; align-items: center; gap: 10px; color: #ccc; font-size: 11px;
+    }
+    .af-auth-divider::before,
+    .af-auth-divider::after {
+      content: ""; flex: 1; border-top: 1px solid #e5e5e5;
+    }
+
+    /* User avatar chip in header (shown after login) */
+    #af-user-chip {
+      display: none; align-items: center; gap: 5px;
+      font-size: 11px; color: rgba(255,255,255,0.9);
+      background: rgba(255,255,255,0.15); border-radius: 20px;
+      padding: 3px 10px 3px 6px; cursor: pointer;
+    }
+    #af-user-chip.visible { display: flex; }
+    #af-user-chip:hover { background: rgba(255,255,255,0.25); }
+    .af-uc-avatar {
+      width: 20px; height: 20px; border-radius: 50%;
+      background: rgba(255,255,255,0.3); display: flex;
+      align-items: center; justify-content: center; font-size: 10px; font-weight: 700;
+    }
+
+    /* Logout dropdown */
+    #af-user-menu {
+      display: none; position: absolute; top: 52px; right: 12px; z-index: 40;
+      background: white; border: 1px solid #e5e5e5; border-radius: 10px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.12); min-width: 160px; overflow: hidden;
+    }
+    #af-user-menu.open { display: block; }
+    .af-um-item {
+      padding: 10px 14px; font-size: 12px; cursor: pointer; color: #333;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .af-um-item:hover { background: #f5f5f5; }
+    .af-um-item.danger { color: #e53935; }
+    .af-um-sep { border-top: 1px solid #f0f0f0; margin: 2px 0; }
+  #af-messages {
+  flex: 1; 
+  padding: 14px 14px 20px; 
+  overflow-y: scroll; /* Force the scrollbar area to exist */
+  background: #f7f8fa;
+  display: flex; 
+  flex-direction: column; 
+  gap: 10px; 
+  min-height: 200px;
+  /* Added to ensure the scrollbar is always visible and interactive */
+  scrollbar-width: auto; 
+  scrollbar-color: ${theme.primary} #f0f0f0;
+}
+  /* Custom Scrollbar Styling */
+#af-messages::-webkit-scrollbar {
+  width: 14px; /* Slightly wider to accommodate arrows comfortably */
+  display: block;
+}
+
+#af-messages::-webkit-scrollbar-track {
+  background: #f0f0f0;
+  border-left: 1px solid #e0e0e0;
+}
+
+#af-messages::-webkit-scrollbar-thumb {
+  background-color: ${theme.primary}aa;
+  border-radius: 10px;
+  border: 3px solid #f0f0f0;
+}
+
+#af-messages::-webkit-scrollbar-thumb:hover {
+  background-color: ${theme.primary};
+}
+
+/* ── The Scrollbar Arrows (Buttons) ── */
+#af-messages::-webkit-scrollbar-button:single-button {
+  background-color: #f0f0f0;
+  display: block;
+  border-style: solid;
+  height: 14px;
+  width: 14px;
+}
+
+/* Up Arrow */
+#af-messages::-webkit-scrollbar-button:single-button:vertical:decrement {
+  border-width: 0 4px 6px 4px;
+  border-color: transparent transparent #666 transparent;
+}
+
+/* Down Arrow */
+#af-messages::-webkit-scrollbar-button:single-button:vertical:increment {
+  border-width: 6px 4px 0 4px;
+  border-color: #666 transparent transparent transparent;
+}
+
+#af-messages::-webkit-scrollbar-button:vertical:single-button:hover {
+  background-color: #e0e0e0;
+}
+    .af-msg {
+      max-width: 86%; padding: 10px 14px; border-radius: 14px; font-size: 13px;
+      line-height: 1.55; word-break: break-word;
+    }
+    .af-msg.user    { background: ${theme.primary}; color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
+    .af-msg.agent   { background: white; color: #222; align-self: flex-start; border: 1px solid #e2e2e2; border-bottom-left-radius: 4px; }
+    .af-msg.thinking{ background: white; color: #aaa; font-style: italic; border: 1px dashed #ddd; align-self: flex-start; }
+    .af-msg.success { background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; align-self: flex-start; border-bottom-left-radius: 4px; font-size: 12.5px; }
+    .af-msg.error   { background: #fdecea; color: #c62828; border: 1px solid #ffcdd2; align-self: flex-start; border-bottom-left-radius: 4px; font-size: 12.5px; }
+    .af-msg.warning { background: #fff8e1; color: #e65100; border: 1px solid #ffe082; align-self: flex-start; border-bottom-left-radius: 4px; font-size: 12.5px; }
+
+    /* ── HTML formatting inside agent bubbles ── */
+    .af-msg.agent p          { margin: 0 0 6px 0; }
+    .af-msg.agent p:last-child { margin-bottom: 0; }
+    .af-msg.agent strong     { font-weight: 700; color: #111; }
+    .af-msg.agent ul,
+    .af-msg.agent ol         { margin: 6px 0 6px 16px; padding: 0; }
+    .af-msg.agent li         { margin-bottom: 4px; line-height: 1.5; }
+    .af-msg.agent br         { display: block; content: ""; margin-top: 4px; }
+
+    /* ── Feedback row (👍/👎/report) ── */
+    .af-feedback-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+    .af-fb-btn {
+      background: none; border: none; cursor: pointer; font-size: 13px;
+      opacity: 0.5; padding: 2px 4px; border-radius: 4px; line-height: 1;
+    }
+    .af-fb-btn:hover { opacity: 1; background: rgba(0,0,0,0.05); }
+    .af-fb-btn:disabled { cursor: default; }
+    .af-feedback-row.af-fb-done .af-fb-btn:not(:disabled) { opacity: 0.3; }
+    .af-fb-thanks { font-size: 11px; color: #888; }
+
+    /* ── Suggested follow-up chips ── */
+    .af-suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .af-suggestion-chip {
+      border: 1px solid #d7dee8; background: #f5f8fc; color: #234; cursor: pointer;
+      font-size: 12px; padding: 5px 10px; border-radius: 14px; line-height: 1.2;
+    }
+    .af-suggestion-chip:hover { background: #e8f0fe; border-color: #b9cdf0; }
+
+    /* ── Command Palette (Ctrl+K) ── */
+    #af-cmdk-overlay {
+      position: fixed; inset: 0; background: rgba(20,24,32,0.45); z-index: 10050;
+      display: none; align-items: flex-start; justify-content: center; padding-top: 12vh;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    }
+    #af-cmdk-overlay.open { display: flex; }
+    #af-cmdk-box {
+      width: 480px; max-width: 90vw; background: #fff; border-radius: 12px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3); overflow: hidden;
+    }
+    #af-cmdk-input {
+      width: 100%; box-sizing: border-box; border: none; outline: none;
+      padding: 16px 18px; font-size: 15px; border-bottom: 1px solid #eee;
+    }
+    #af-cmdk-list { max-height: 320px; overflow-y: auto; padding: 6px; }
+    .af-cmdk-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; font-size: 14px; color: #222; }
+    .af-cmdk-item.active, .af-cmdk-item:hover { background: #f0f4ff; }
+    .af-cmdk-empty { padding: 14px 12px; color: #999; font-size: 13px; }
+
+    /* ── Field Help mode badge ── */
+    #af-field-help-badge {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: #1a1a2e; color: #fff; font-size: 12px; padding: 8px 14px;
+      border-radius: 20px; z-index: 10060; box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    }
+
+    /* ── Attachment preview inside messages ── */
+    .af-msg-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .af-att-thumb {
+      position: relative; border-radius: 8px; overflow: hidden;
+      width: 80px; height: 80px; background: #f0f0f0;
+      display: flex; align-items: center; justify-content: center;
+      border: 1px solid rgba(255,255,255,0.3);
+    }
+    .af-att-thumb img { width: 100%; height: 100%; object-fit: cover; }
+    .af-att-file {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 3px; padding: 8px; text-align: center; width: 100%; height: 100%;
+    }
+    .af-att-file .af-att-icon { font-size: 22px; }
+    .af-att-file .af-att-name {
+      font-size: 9px; word-break: break-all; overflow: hidden;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      color: #555; line-height: 1.3;
+    }
+
+
+    /* ── Download file bubble ── */
+    .af-download-card {
+      background: white; border: 1.5px solid ${theme.primary}44;
+      border-radius: 12px; padding: 12px 14px;
+      align-self: flex-start; max-width: 88%;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .af-dl-label { font-size: 10px; font-weight: 700; letter-spacing: 0.5px; color: ${theme.primary}; text-transform: uppercase; }
+    .af-dl-file  { display: flex; align-items: center; gap: 10px; }
+    .af-dl-icon  { font-size: 22px; }
+    .af-dl-info  { flex: 1; min-width: 0; }
+    .af-dl-name  { font-size: 13px; font-weight: 600; color: #222; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .af-dl-size  { font-size: 11px; color: #888; margin-top: 1px; }
+    .af-dl-btn   {
+      padding: 7px 14px; background: ${theme.primary}; color: white;
+      border: none; border-radius: 8px; font-size: 12px; font-weight: 600;
+      cursor: pointer; white-space: nowrap; transition: opacity 0.18s;
+    }
+    .af-dl-btn:hover { opacity: 0.85; }
+
+    /* ── Files panel ── */
+    #af-files-panel {
+      display: none; flex-direction: column;
+      position: absolute; inset: 0; background: #f7f8fa;
+      z-index: 20; border-radius: 0 0 16px 16px;
+      overflow: hidden;
+    }
+    #af-files-panel.open { display: flex; }
+    .af-fp-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 14px; background: ${theme.primary}; color: white;
+      font-size: 13px; font-weight: 700; flex-shrink: 0;
+    }
+    .af-fp-header-left { display: flex; align-items: center; gap: 8px; }
+    .af-fp-close {
+      cursor: pointer; opacity: 0.75; display: flex; align-items: center;
+      background: none; border: none; color: white; padding: 2px;
+    }
+    .af-fp-close:hover { opacity: 1; }
+    /* File panel tabs */
+    .af-fp-tabs {
+      display: flex; flex-shrink: 0;
+      border-bottom: 1px solid #e4e4e4; background: white;
+    }
+    .af-fp-tab {
+      flex: 1; padding: 9px 4px; font-size: 11px; font-weight: 700;
+      color: #aaa; border: none; background: none; cursor: pointer;
+      border-bottom: 2px solid transparent; display: flex; align-items: center;
+      justify-content: center; gap: 5px; transition: color 0.15s;
+    }
+    .af-fp-tab.active { color: ${theme.primary}; border-bottom-color: ${theme.primary}; }
+    .af-fp-tab:hover:not(.active) { color: #666; }
+    .af-fp-notice {
+      background: #e8f5e9; border-bottom: 1px solid #c8e6c9;
+      padding: 7px 14px; font-size: 11px; color: #2e7d32;
+      display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+    }
+    .af-fp-list { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+    .af-fp-empty { text-align: center; padding: 40px 16px; color: #aaa; font-size: 13px; }
+    .af-fp-item {
+      background: white; border: 1px solid #e4e4e4; border-radius: 10px;
+      padding: 10px 12px; display: flex; align-items: center; gap: 10px;
+    }
+    .af-fp-item-icon { flex-shrink: 0; color: ${theme.primary}; opacity: 0.8; }
+    .af-fp-item-info { flex: 1; min-width: 0; }
+    .af-fp-item-name { font-size: 12px; font-weight: 600; color: #222; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .af-fp-item-meta { font-size: 10px; color: #888; margin-top: 2px; }
+    .af-fp-item-badge {
+      font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
+      padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
+    }
+    .af-fp-item-badge.sent { background: ${theme.light}; color: ${theme.primary}; }
+    .af-fp-item-badge.received { background: #e8f5e9; color: #2e7d32; }
+    .af-lib-badge {
+      font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+      background: ${theme.light}; color: ${theme.primary}; flex-shrink: 0;
+      text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .af-fp-item-dl {
+      padding: 6px; background: ${theme.primary}; color: white;
+      border: none; border-radius: 6px; font-size: 11px; font-weight: 600;
+      cursor: pointer; flex-shrink: 0; transition: opacity 0.18s;
+      display: flex; align-items: center;
+    }
+    .af-fp-item-dl:hover { opacity: 0.85; }
+    .af-fp-footer {
+      padding: 8px 14px; border-top: 1px solid #e4e4e4;
+      display: flex; justify-content: flex-end; flex-shrink: 0;
+    }
+    .af-fp-clear {
+      font-size: 11px; color: #aaa; background: none; border: none;
+      cursor: pointer; padding: 4px 8px; display: flex; align-items: center; gap: 5px;
+    }
+    .af-fp-clear:hover { color: #e53935; }
+    /* ── Files badge on header btn ── */
+    #af-files-btn {
+      background: none; border: none; cursor: pointer;
+      color: rgba(255,255,255,0.8); padding: 4px; position: relative;
+      display: flex; align-items: center;
+    }
+    #af-files-btn:hover { color: white; }
+    .af-files-badge {
+      position: absolute; top: -2px; right: -2px;
+      background: #ff5722; color: white; border-radius: 50%;
+      width: 14px; height: 14px; font-size: 8px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      line-height: 1;
+    }
+
+    /* ── Confirm card ── */
+    .af-confirm-card {
+      background: white; border: 1.5px solid ${theme.primary}33;
+      border-radius: 12px; align-self: flex-start; max-width: 92%;
+      box-shadow: 0 3px 14px rgba(0,0,0,0.08); overflow: hidden;
+      flex-shrink: 0; min-width: 240px;
+    }
+    .af-confirm-header {
+      background: ${theme.primary}; color: white;
+      padding: 8px 13px; display: flex; align-items: center; justify-content: space-between;
+    }
+    .af-confirm-header-label { font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; }
+    .af-confirm-header-count { font-size: 11px; opacity: 0.8; }
+    .af-confirm-goal {
+      font-size: 13px; font-weight: 600; color: #111;
+      padding: 9px 13px; border-bottom: 1px solid #f0f0f0;
+    }
+    .af-confirm-rows { padding: 4px 0; max-height: 160px; overflow-y: auto; }
+    .af-confirm-row {
+      display: flex; align-items: center; gap: 9px;
+      padding: 6px 13px; font-size: 12px; color: #333;
+      border-bottom: 1px solid #f5f5f5;
+    }
+    .af-confirm-row:last-child { border-bottom: none; }
+    .af-confirm-row-icon { font-size: 13px; flex-shrink: 0; width: 20px; text-align: center; }
+    .af-confirm-row-text { flex: 1; line-height: 1.35; }
+    .af-confirm-btns { display: flex; gap: 8px; padding: 10px 13px; border-top: 1px solid #f0f0f0; }
+    .af-confirm-btns button { flex: 1; padding: 8px 0; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.18s; }
+    .af-btn-yes { background: ${theme.primary}; color: white; }
+    .af-btn-no  { background: #f0f0f0; color: #555; }
+
+    /* ── File select card ── */
+    .af-file-select-card {
+      background: white; border: 1.5px solid ${theme.primary}33;
+      border-radius: 12px; align-self: flex-start; max-width: 92%;
+      box-shadow: 0 3px 14px rgba(0,0,0,0.08); overflow: hidden;
+      flex-shrink: 0; min-width: 240px;
+    }
+    .af-fsc-header {
+      background: ${theme.primary}; color: white;
+      padding: 8px 13px; font-size: 11px; font-weight: 700;
+      letter-spacing: 0.5px; text-transform: uppercase;
+    }
+    .af-fsc-prompt {
+      font-size: 13px; color: #333; padding: 10px 13px 6px;
+      border-bottom: 1px solid #f0f0f0; line-height: 1.45;
+    }
+    .af-fsc-list {
+      padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .af-fsc-option {
+      display: flex; align-items: center; gap: 9px;
+      padding: 8px 11px; border-radius: 8px; cursor: pointer;
+      border: 1.5px solid #e4e4e4; background: #fafafa;
+      font-size: 12.5px; color: #222; font-weight: 500;
+      transition: border-color 0.15s, background 0.15s;
+      text-align: left; width: 100%;
+    }
+    .af-fsc-option:hover {
+      border-color: ${theme.primary}; background: ${theme.light};
+      color: ${theme.primary};
+    }
+    .af-fsc-option-icon { font-size: 16px; flex-shrink: 0; }
+    .af-fsc-cancel {
+      display: block; width: 100%; padding: 8px 13px;
+      border: none; border-top: 1px solid #f0f0f0;
+      background: none; font-size: 12px; color: #aaa;
+      cursor: pointer; text-align: center;
+    }
+    .af-fsc-cancel:hover { color: #e53935; }
+    .af-confirm-btns button:hover { opacity: 0.85; }
+    .af-confirm-btns button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Attachment staging area (above input) ── */
+    #af-attachment-tray {
+      display: none; padding: 8px 12px 4px;
+      background: white; border-top: 1px solid #f0f0f0;
+      flex-wrap: wrap; gap: 8px; flex-shrink: 0;
+    }
+    #af-attachment-tray.has-items { display: flex; }
+    .af-staged {
+      position: relative; width: 60px; height: 60px;
+      border-radius: 8px; overflow: hidden; border: 1.5px solid #e0e0e0;
+      background: #f7f8fa;
+    }
+    .af-staged img { width: 100%; height: 100%; object-fit: cover; }
+    .af-staged-file {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 100%; gap: 2px; padding: 6px;
+    }
+    .af-staged-file .af-si { font-size: 18px; }
+    .af-staged-file .af-sn { font-size: 8px; color: #666; text-align: center; word-break: break-all; overflow: hidden; max-height: 24px; }
+    .af-staged-remove {
+      position: absolute; top: 2px; right: 2px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: rgba(0,0,0,0.55); color: white;
+      border: none; cursor: pointer; font-size: 9px;
+      display: flex; align-items: center; justify-content: center;
+      line-height: 1;
+    }
+
+    /* ── Voice preview bar ── */
+    #af-voice-preview {
+      display: none; align-items: center; gap: 8px;
+      padding: 8px 12px; background: #f0f7ff;
+      border-top: 1px solid #d0e4ff; flex-shrink: 0;
+    }
+    #af-voice-preview.visible { display: flex; }
+    #af-voice-preview .vp-icon { font-size: 16px; flex-shrink: 0; }
+    #af-voice-preview .vp-label { font-size: 11px; color: #0052cc; font-weight: 600; flex-shrink: 0; }
+    #af-voice-preview input {
+      flex: 1; border: 1.5px solid #b3d4ff; border-radius: 8px;
+      padding: 6px 10px; font-size: 12px; outline: none;
+      font-family: inherit; background: white; color: #333;
+    }
+    #af-voice-preview input:focus { border-color: ${theme.primary}; }
+    #af-vp-send {
+      padding: 6px 12px; background: ${theme.primary}; color: white;
+      border: none; border-radius: 8px; font-size: 12px; font-weight: 600;
+      cursor: pointer; flex-shrink: 0;
+    }
+    #af-vp-send:hover { background: ${theme.accent}; }
+    #af-vp-discard {
+      padding: 6px 10px; background: none; color: #999;
+      border: 1px solid #ddd; border-radius: 8px; font-size: 12px;
+      cursor: pointer; flex-shrink: 0;
+    }
+    #af-vp-discard:hover { color: #e53935; border-color: #e53935; }
+
+    /* ── Recording indicator ── */
+    #af-recording-bar {
+      display: none; align-items: center; justify-content: center; gap: 8px;
+      padding: 6px 12px; background: #fff0f0;
+      border-top: 1px solid #ffcdd2; font-size: 12px; color: #c62828;
+      flex-shrink: 0;
+    }
+    #af-recording-bar.visible { display: flex; }
+    .af-rec-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: #e53935;
+      animation: af-pulse 0.8s infinite;
+    }
+    #af-rec-timer { font-family: monospace; font-size: 12px; font-weight: 700; }
+
+    /* ── Input area ── */
+    #af-input-area {
+      padding: 10px 12px; border-top: 1px solid #e6e6e6;
+      display: flex; gap: 7px; background: white; flex-shrink: 0; align-items: center;
+    }
+    #af-attach-btn {
+      width: 36px; height: 36px; border-radius: 50%; border: 1.5px solid #ddd;
+      background: white; cursor: pointer; font-size: 15px;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.18s; flex-shrink: 0; color: #666;
+      user-select: none;
+    }
+    #af-attach-btn:hover { border-color: ${theme.primary}; color: ${theme.primary}; }
+    #af-attach-btn.has-files { border-color: ${theme.primary}; background: ${theme.light}; color: ${theme.primary}; }
+    #af-file-input { display: none; }
+    #af-input {
+      flex: 1; padding: 10px 14px; border: 1.5px solid #ddd; border-radius: 24px;
+      font-size: 13px; outline: none; font-family: inherit; transition: border-color 0.18s;
+    }
+    #af-input:focus { border-color: ${theme.primary}; }
+    #af-input:disabled { background: #f5f5f5; color: #aaa; }
+    #af-send, #af-mic {
+      width: 38px; height: 38px; border-radius: 50%; border: none;
+      cursor: pointer; font-size: 16px; display: flex; align-items: center;
+      justify-content: center; transition: all 0.18s; flex-shrink: 0;
+    }
+    #af-send { background: ${theme.primary}; color: white; }
+    #af-send:hover { background: ${theme.accent}; }
+    #af-send:disabled { background: #ccc; cursor: not-allowed; }
+    #af-mic { background: white; color: #666; border: 1.5px solid #ddd; }
+    #af-mic:hover { border-color: ${theme.primary}; color: ${theme.primary}; }
+    #af-mic:disabled { opacity: 0.4; cursor: not-allowed; }
+    #af-mic.listening { background: #e53935; color: white; border-color: #e53935; animation: af-pulse 0.8s infinite; }
+
+    /* ── File steps card ── */
+    .af-file-steps {
+      align-self: flex-start; max-width: 94%;
+      background: white; border: 1px solid #e2e2e2;
+      border-radius: 12px; overflow: hidden;
+      font-size: 12.5px; border-bottom-left-radius: 4px;
+    }
+    .af-fsteps-header {
+      background: #f0f4ff; padding: 7px 12px;
+      font-size: 11px; font-weight: 700; color: ${theme.primary};
+      border-bottom: 1px solid #e2e2e2;
+    }
+    .af-fsteps-list { padding: 6px 4px; display: flex; flex-direction: column; gap: 2px; }
+    .af-fstep {
+      display: flex; align-items: flex-start; gap: 8px;
+      padding: 5px 10px; border-radius: 6px;
+    }
+    .af-fstep:hover { background: #f7f8fa; }
+    .af-fstep-icon { font-size: 13px; flex-shrink: 0; margin-top: 1px; }
+    .af-fstep-body { flex: 1; min-width: 0; }
+    .af-fstep-label { font-weight: 600; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .af-fstep-preview { font-size: 11px; color: #888; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+
+    #af-branding {
+      text-align: center; font-size: 10px; color: #ccc;
+      padding: 5px; background: white; border-top: 1px solid #f0f0f0; flex-shrink: 0;
+    }
+    #af-branding a { color: ${theme.primary}; text-decoration: none; font-weight: 700; }
+    /* Modern Icon Styling */
+.af-fp-item-icon { font-size: 22px; color: #555; }
+.af-fp-delete {
+  background: none; border: none; color: #ff5252;
+  cursor: pointer; padding: 5px; opacity: 0.6;
+  transition: opacity 0.2s; font-size: 16px;
+}
+.af-fp-delete:hover { opacity: 1; }
+
+/* Files Panel Loader */
+.af-fp-loading { text-align: center; padding: 20px; color: #888; font-size: 13px; }
+
+  `;
+  document.head.appendChild(style);
+
+  // ── Build HTML ────────────────────────────────────────
+  const launcher = document.createElement("button");
+  launcher.id   = "af-launcher";
+  launcher.type = "button";
+  launcher.setAttribute("aria-label", "Open chat");
+  launcher.innerHTML = `
+    <!-- Logo icon (default) -->
+    <span class="af-icon-logo">
+      <img src='https://dominicyogi.github.io/agentflow-widget/liontech.png'
+           style='width:34px;height:34px;object-fit:contain;border-radius:50%;display:block;'
+           alt='Chat' />
+    </span>
+    <!-- Close X icon (shown when panel is open) -->
+    <span class="af-icon-close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"
+           stroke-linecap="round" style="width:26px;height:26px;">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6"  y1="6" x2="18" y2="18"/>
+      </svg>
+    </span>
+  `;
+  document.body.appendChild(launcher);
+
+  const panel = document.createElement("div");
+  panel.id = "af-panel";
+  panel.innerHTML = `
+    <!-- ══ AUTH SCREEN ═══════════════════════════════════ -->
+    <div id="af-auth-screen">
+      <div class="af-auth-header">
+        <img class="af-auth-logo" src="https://dominicyogi.github.io/agentflow-widget/liontech.png" alt="Logo" />
+        <div class="af-auth-header-text">
+          <div class="af-auth-header-title">Liontech Support Bot</div>
+          <div class="af-auth-header-sub" id="af-auth-org-sub">Sign in to continue</div>
+        </div>
+      </div>
+
+      <!-- LOGIN FORM -->
+      <div id="af-auth-login" class="af-auth-body">
+        <div>
+          <h2 class="af-auth-title">Welcome back</h2>
+          <p class="af-auth-subtitle">Sign in to your account</p>
+        </div>
+        <div id="af-login-error" class="af-auth-error">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span id="af-login-error-msg"></span>
+        </div>
+        <div class="af-auth-field">
+          <label>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+            Email
+          </label>
+          <input type="email" id="af-login-email" placeholder="you@organisation.com" autocomplete="email" />
+        </div>
+        <div class="af-auth-field">
+          <label>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Password
+          </label>
+          <input type="password" id="af-login-password" placeholder="Your password" autocomplete="current-password" />
+        </div>
+        <button class="af-auth-btn" id="af-login-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:14px;height:14px;"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+          Sign in
+        </button>
+        <div class="af-auth-switch">
+          <a id="af-goto-forgot">Forgot password?</a>
+        </div>
+        <div class="af-auth-divider">or</div>
+        <div class="af-auth-switch">
+          Don't have an account? <a id="af-goto-signup">Create one</a>
+        </div>
+      </div>
+
+      <!-- SIGNUP FORM -->
+      <div id="af-auth-signup" class="af-auth-body" style="display:none">
+        <div>
+          <h2 class="af-auth-title">Create account</h2>
+          <p class="af-auth-subtitle">Join your organisation's workspace</p>
+        </div>
+        <div id="af-signup-error" class="af-auth-error">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span id="af-signup-error-msg"></span>
+        </div>
+        <div id="af-signup-success" class="af-auth-success">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>
+          <span>Account created! Signing you in...</span>
+        </div>
+        <div class="af-auth-row">
+          <div class="af-auth-field">
+            <label>First name</label>
+            <input type="text" id="af-signup-first" placeholder="Ada" autocomplete="given-name" />
+          </div>
+          <div class="af-auth-field">
+            <label>Last name</label>
+            <input type="text" id="af-signup-last" placeholder="Lovelace" autocomplete="family-name" />
+          </div>
+        </div>
+        <div class="af-auth-field">
+          <label>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+            Email
+          </label>
+          <input type="email" id="af-signup-email" placeholder="you@organisation.com" autocomplete="email" />
+        </div>
+        <div class="af-auth-field">
+          <label>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Password <span style="color:#bbb;font-weight:400;">(min 8 chars)</span>
+          </label>
+          <input type="password" id="af-signup-password" placeholder="Choose a strong password" autocomplete="new-password" />
+        </div>
+        <button class="af-auth-btn" id="af-signup-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:14px;height:14px;"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+          Create account
+        </button>
+        <div class="af-auth-switch">
+          Already have an account? <a id="af-goto-login">Sign in</a>
+        </div>
+      </div>
+
+      <!-- FORGOT PASSWORD FORM -->
+      <div id="af-auth-forgot" class="af-auth-body" style="display:none">
+        <div>
+          <h2 class="af-auth-title">Reset password</h2>
+          <p class="af-auth-subtitle">We'll send a reset link to your email</p>
+        </div>
+        <div id="af-forgot-error" class="af-auth-error">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span id="af-forgot-error-msg"></span>
+        </div>
+        <div id="af-forgot-success" class="af-auth-success">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+          <span>Check your inbox — a reset link is on its way.</span>
+        </div>
+        <div class="af-auth-field">
+          <label>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+            Email address
+          </label>
+          <input type="email" id="af-forgot-email" placeholder="you@organisation.com" autocomplete="email" />
+        </div>
+        <button class="af-auth-btn" id="af-forgot-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:14px;height:14px;"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+          Send reset link
+        </button>
+        <div class="af-auth-switch">
+          <a id="af-goto-login2">Back to sign in</a>
+        </div>
+      </div>
+    </div><!-- end #af-auth-screen -->
+
+    <!-- Resize grip — drag to resize the panel; hidden in full screen -->
+    <div class="af-resize-handle" id="af-resize-handle" title="Drag to resize"></div>
+
+    <!-- ══ MAIN CHAT PANEL ═══════════════════════════════ -->
+    <div id="af-header">
+      <div class="af-hinfo">
+        <div class="af-title"><img src='https://dominicyogi.github.io/agentflow-widget/liontech.png' style='width:18px;height:18px;object-fit:contain;vertical-align:middle;margin-right:5px;' alt='Logo' />Liontech</div>
+        <div class="af-sub" id="af-client-name">Connecting...</div>
+      </div>
+      <div class="af-hright">
+        <div style="display:flex;align-items:center;gap:5px;font-size:11px;">
+          <div class="af-dot" id="af-status-dot"></div><span id="af-status-label">Live</span>
+        </div>
+        <button id="af-fullscreen-btn" type="button" title="Full screen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3"></path>
+            <path d="M21 8V5a2 2 0 0 0-2-2h-3"></path>
+            <path d="M3 16v3a2 2 0 0 0 2 2h3"></path>
+            <path d="M16 21h3a2 2 0 0 0 2-2v-3"></path>
+          </svg>
+        </button>
+        <button id="af-explain-page-btn" type="button" title="Explain this page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="16" x2="12" y2="11.5"></line>
+            <circle cx="12" cy="8" r="0.9" fill="currentColor" stroke="none"></circle>
+          </svg>
+        </button>
+        <button id="af-history-btn" type="button" title="Conversation history">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;">
+            <circle cx="12" cy="12" r="9"></circle>
+            <polyline points="12 7 12 12 16 14"></polyline>
+          </svg>
+        </button>
+        <!-- User chip — shown after login -->
+        <div id="af-user-chip">
+          <div class="af-uc-avatar" id="af-uc-initials"></div>
+          <span id="af-uc-name"></span>
+        </div>
+        <!-- User dropdown menu -->
+        <div id="af-user-menu">
+          <div class="af-um-item" id="af-um-profile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            My profile
+          </div>
+          <div class="af-um-sep"></div>
+          <div class="af-um-item danger" id="af-um-logout">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Sign out
+          </div>
+        </div>
+        <button id="af-files-btn" title="Files &amp; Library">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          <span class="af-files-badge" id="af-files-badge" style="display:none"></span>
+        </button>
+      </div>
+    </div>
+    <!-- Network warning banner -->
+    <div id="af-net-banner">
+      <span class="af-nb-icon" id="af-nb-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      </span>
+      <span class="af-nb-msg" id="af-nb-msg">Connection issue</span>
+      <button class="af-nb-retry" id="af-nb-retry">Retry</button>
+    </div>
+    <!-- Bot offline banner -->
+    <div id="af-bot-offline-banner">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;flex-shrink:0;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <span>The assistant is currently offline. Please try again later.</span>
+    </div>
+
+    <!-- Files / Library panel overlay -->
+    <div id="af-files-panel">
+      <div class="af-fp-header">
+        <div class="af-fp-header-left">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          Files &amp; Library
+        </div>
+        <button class="af-fp-close" id="af-fp-close" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:15px;height:15px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <!-- Tabs -->
+      <div class="af-fp-tabs">
+        <button class="af-fp-tab active" id="af-tab-library" data-tab="library">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+          Library
+        </button>
+        <button class="af-fp-tab" id="af-tab-workspace" data-tab="workspace">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+          My Files
+        </button>
+      </div>
+      <div class="af-fp-notice" id="af-fp-notice">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;flex-shrink:0;"><polyline points="20 6 9 17 4 12"/></svg>
+        <span id="af-fp-notice-text">Reference files shared by your organisation</span>
+      </div>
+      <div class="af-fp-list" id="af-fp-list">
+        <div class="af-fp-empty">Loading files...</div>
+      </div>
+      <div class="af-fp-footer">
+        <button class="af-fp-clear" id="af-fp-clear">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px;"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          Clear workspace files
+        </button>
+      </div>
+    </div>
+
+    <!-- Conversation History panel (§23) — overlays the chat, toggled by the header clock icon -->
+    <div id="af-history-panel">
+      <div id="af-history-head">
+        <input id="af-history-search" type="text" placeholder="Search conversations…" autocomplete="off" />
+        <button id="af-history-new" title="Start a new conversation">+ New</button>
+        <button id="af-history-close" title="Close">✕</button>
+      </div>
+      <div id="af-history-list"></div>
+    </div>
+
+    <div id="af-messages">
+      <div class="af-msg thinking">Connecting to your AI agent...</div>
+    </div>
+    <!-- Staged attachments tray -->
+    <div id="af-attachment-tray"></div>
+
+    <!-- Voice note preview bar (shown after recording stops) -->
+    <div id="af-voice-preview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="vp-icon" style="width:14px;height:14px;flex-shrink:0;"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      <span class="vp-label">Voice:</span>
+      <input id="af-vp-text" type="text" placeholder="Edit your message..." />
+      <button id="af-vp-send">Send</button>
+      <button id="af-vp-discard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+
+    <!-- Recording indicator -->
+    <div id="af-recording-bar">
+      <div class="af-rec-dot"></div>
+      <span>Recording</span>
+      <span id="af-rec-timer">0:00</span>
+      <span style="font-size:11px;color:#999;margin-left:4px;">Click mic to stop</span>
+    </div>
+
+    <div id="af-input-area">
+      <label id="af-attach-btn" for="af-file-input" title="Attach file">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:1.2em;height:1.2em;"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      </label>
+      <input id="af-file-input" type="file" multiple accept="image/*" />
+      <input id="af-input" type="text" placeholder="Ask me anything..." disabled />
+      <button id="af-mic" type="button" disabled>${ICONS.mic}</button>
+      <button id="af-send" type="button" disabled>${ICONS.send}</button>
+    </div>
+    <div id="af-branding">Powered by <a href="#">Liontech</a></div>
+
+  `;
+  document.body.appendChild(panel);
+
+  // ── Panel toggle ──────────────────────────────────────
+  // The launcher button itself is the only open/close control.
+  // Adding .open to the launcher triggers the logo→X icon morph via CSS.
+  function openPanel()  {
+    panel.classList.add("open");
+    launcher.classList.add("open");
+    launcher.setAttribute("aria-label", "Close chat");
+  }
+  function closePanel() {
+    panel.classList.remove("open");
+    launcher.classList.remove("open");
+    launcher.setAttribute("aria-label", "Open chat");
+  }
+  function togglePanel() {
+    panel.classList.contains("open") ? closePanel() : openPanel();
+  }
+  launcher.addEventListener("click", togglePanel);
+
+  // ── Resize (drag top-left grip) + Full screen toggle ──
+  // Panel is anchored to bottom/right; dragging the grip grows the panel
+  // up and to the left. Full screen expands to fill the viewport (with
+  // a small margin) and remembers the prior size/position to restore.
+  (function () {
+    const resizeHandle = document.getElementById("af-resize-handle");
+    const fsBtn         = document.getElementById("af-fullscreen-btn");
+    if (!resizeHandle || !fsBtn) return;
+
+    const EXPAND_ICON = fsBtn.innerHTML;
+    const COLLAPSE_ICON = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;">
+        <path d="M8 3v3a2 2 0 0 1-2 2H3"></path>
+        <path d="M21 8h-3a2 2 0 0 1-2-2V3"></path>
+        <path d="M3 16h3a2 2 0 0 1 2 2v3"></path>
+        <path d="M16 21v-3a2 2 0 0 1 2-2h3"></path>
+      </svg>`;
+
+    let resizing = false, startX = 0, startY = 0, startW = 0, startH = 0;
+    let isFullscreen = false;
+    let savedStyle = null; // { width, height, top }
+
+    function clientPos(e) {
+      if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      return { x: e.clientX, y: e.clientY };
+    }
+
+    function startResize(e) {
+      if (isFullscreen) return;
+      const p = clientPos(e);
+      const rect = panel.getBoundingClientRect();
+      resizing = true;
+      startX = p.x; startY = p.y;
+      startW = rect.width; startH = rect.height;
+      // Switch from top+bottom sizing to bottom+explicit-height so height
+      // can be driven directly while the bottom edge stays anchored.
+      panel.style.top    = "auto";
+      panel.style.width  = startW + "px";
+      panel.style.height = startH + "px";
+      panel.classList.add("af-resizing");
+      document.body.style.userSelect = "none";
+      e.preventDefault();
+    }
+
+    function doResize(e) {
+      if (!resizing) return;
+      const p = clientPos(e);
+      const dx = startX - p.x; // dragging left/up (toward top-left) grows the panel
+      const dy = startY - p.y;
+      const maxW = Math.min(window.innerWidth - 40, 900);
+      const maxH = window.innerHeight - 32;
+      const newW = Math.min(Math.max(startW + dx, 320), maxW);
+      const newH = Math.min(Math.max(startH + dy, 380), maxH);
+      panel.style.width  = newW + "px";
+      panel.style.height = newH + "px";
+      e.preventDefault();
+    }
+
+    function stopResize() {
+      if (!resizing) return;
+      resizing = false;
+      panel.classList.remove("af-resizing");
+      document.body.style.userSelect = "";
+    }
+
+    resizeHandle.addEventListener("mousedown", startResize);
+    document.addEventListener("mousemove", doResize);
+    document.addEventListener("mouseup", stopResize);
+    resizeHandle.addEventListener("touchstart", startResize, { passive: false });
+    document.addEventListener("touchmove", doResize, { passive: false });
+    document.addEventListener("touchend", stopResize);
+
+    function enterFullscreen() {
+      savedStyle = { width: panel.style.width, height: panel.style.height, top: panel.style.top };
+      panel.classList.add("af-fullscreen");
+      isFullscreen = true;
+      fsBtn.innerHTML = COLLAPSE_ICON;
+      fsBtn.title = "Exit full screen";
+    }
+
+    function exitFullscreen() {
+      panel.classList.remove("af-fullscreen");
+      if (savedStyle) {
+        panel.style.width  = savedStyle.width;
+        panel.style.height = savedStyle.height;
+        panel.style.top    = savedStyle.top;
+      }
+      isFullscreen = false;
+      fsBtn.innerHTML = EXPAND_ICON;
+      fsBtn.title = "Full screen";
+    }
+
+    fsBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      isFullscreen ? exitFullscreen() : enterFullscreen();
+    });
+  })();
+
+  // ── "Explain This Page" button ────────────────────────
+  // Opens the panel (if closed) and sends a canned request through the
+  // normal sendMessage() pipeline — page context is already attached
+  // automatically, and the backend expands this into a structured
+  // explanation (purpose, sections, fields, actions, mistakes, etc.).
+  (function () {
+    const explainBtn = document.getElementById("af-explain-page-btn");
+    if (!explainBtn) return;
+    explainBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (isProcessing || !botActive) return;
+      if (!panel.classList.contains("open")) openPanel();
+      sendMessage("Explain this page");
+    });
+  })();
+
+  // ── AI Command Palette (Ctrl+K / Cmd+K) ────────────────
+  // Universal quick-command interface. Ctrl/Cmd+K opens it from anywhere on
+  // the host page; typing filters canned commands (nav shortcuts, creation
+  // shortcuts, Learning Center lessons, Explain This Page/Error); Enter runs
+  // the top match through the normal sendMessage() pipeline.
+  (function () {
+    const COMMANDS = [
+      { label: "Create customer",        run: "Create customer" },
+      { label: "Create supplier",        run: "Create supplier" },
+      { label: "Open inventory",         run: "Open inventory" },
+      { label: "Generate report",        run: "Generate report" },
+      { label: "Go to payroll",          run: "Go to payroll" },
+      { label: "Show pending invoices",  run: "Show pending invoices" },
+      { label: "Explain this page",      run: "Explain this page" },
+      { label: "Explain this error",     run: "Explain this error" },
+      { label: "Teach me Sales",         run: "Teach me Sales" },
+      { label: "Teach me Inventory",     run: "Teach me Inventory" },
+      { label: "Teach me Purchasing",    run: "Teach me Purchasing" },
+      { label: "Teach me Finance",       run: "Teach me Finance" },
+      { label: "Toggle Field Help mode", action: "field-help" }
+    ];
+
+    const overlay = document.createElement("div");
+    overlay.id = "af-cmdk-overlay";
+    overlay.innerHTML = `
+      <div id="af-cmdk-box">
+        <input id="af-cmdk-input" type="text" placeholder="Type a command… (e.g. Create customer)" autocomplete="off" />
+        <div id="af-cmdk-list"></div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    const box   = overlay.querySelector("#af-cmdk-box");
+    const input = overlay.querySelector("#af-cmdk-input");
+    const list  = overlay.querySelector("#af-cmdk-list");
+    let activeIdx = 0;
+    let filtered  = COMMANDS;
+
+    function renderList() {
+      list.innerHTML = filtered.map((c, i) =>
+        `<div class="af-cmdk-item${i === activeIdx ? " active" : ""}" data-idx="${i}">${escHtml(c.label)}</div>`
+      ).join("") || `<div class="af-cmdk-empty">No matching commands</div>`;
+    }
+
+    function openPalette() {
+      overlay.classList.add("open");
+      input.value = "";
+      filtered = COMMANDS;
+      activeIdx = 0;
+      renderList();
+      setTimeout(() => input.focus(), 10);
+    }
+    function closePalette() { overlay.classList.remove("open"); }
+
+    function runCommand(cmd) {
+      if (!cmd) return;
+      closePalette();
+      if (cmd.action === "field-help") { toggleFieldHelp(); return; }
+      if (isProcessing || !botActive) return;
+      if (!panel.classList.contains("open")) openPanel();
+      sendMessage(cmd.run);
+    }
+
+    input.addEventListener("input", () => {
+      const q = input.value.toLowerCase().trim();
+      filtered = q ? COMMANDS.filter(c => c.label.toLowerCase().includes(q)) : COMMANDS;
+      activeIdx = 0;
+      renderList();
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, filtered.length - 1); renderList(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); renderList(); }
+      else if (e.key === "Enter") { e.preventDefault(); runCommand(filtered[activeIdx]); }
+      else if (e.key === "Escape") { e.preventDefault(); closePalette(); }
+    });
+    list.addEventListener("click", (e) => {
+      const item = e.target.closest(".af-cmdk-item");
+      if (item) runCommand(filtered[+item.getAttribute("data-idx")]);
+    });
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closePalette(); });
+
+    document.addEventListener("keydown", (e) => {
+      if (!MVP_FEATURES.commandPalette) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        overlay.classList.contains("open") ? closePalette() : openPalette();
+      }
+    });
+
+    // ── Field Help mode (Section 6: Field Explanation) ──
+    // When active, clicking any field on the HOST page (not inside the
+    // widget) sends its label/type/value to the backend for a structured
+    // explanation instead of interacting with the field normally.
+    let fieldHelpActive = false;
+    let fieldHelpBadge = null;
+
+    function fieldMeta(el) {
+      const label =
+        el.closest("label")?.textContent?.trim() ||
+        document.querySelector(`label[for="${el.id}"]`)?.textContent?.trim() ||
+        el.getAttribute("aria-label") || el.placeholder || el.name || el.id || "(unlabeled field)";
+      const options = el.tagName === "SELECT"
+        ? Array.from(el.options).map(o => o.textContent.trim()).filter(Boolean).slice(0, 20).join(", ")
+        : "";
+      return `label="${label.replace(/"/g, "'")}" type="${el.type || el.tagName.toLowerCase()}" ` +
+             `currentValue="${(el.value || "").toString().slice(0, 100).replace(/"/g, "'")}"` +
+             (options ? ` options="${options.replace(/"/g, "'")}"` : "");
+    }
+
+    function fieldHelpClickHandler(e) {
+      const el = e.target.closest("input, select, textarea");
+      if (!el || el.closest("#af-panel") || el.closest("#af-cmdk-overlay")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (isProcessing || !botActive) return;
+      if (!panel.classList.contains("open")) openPanel();
+      sendMessage("[FIELD_EXPLAIN] " + fieldMeta(el));
+    }
+
+    function toggleFieldHelp() {
+      fieldHelpActive = !fieldHelpActive;
+      if (fieldHelpActive) {
+        document.addEventListener("click", fieldHelpClickHandler, true);
+        document.body.style.cursor = "help";
+        fieldHelpBadge = document.createElement("div");
+        fieldHelpBadge.id = "af-field-help-badge";
+        fieldHelpBadge.textContent = "Field Help: click any field · Esc to exit";
+        document.body.appendChild(fieldHelpBadge);
+        document.addEventListener("keydown", fieldHelpEscHandler);
+      } else {
+        document.removeEventListener("click", fieldHelpClickHandler, true);
+        document.body.style.cursor = "";
+        if (fieldHelpBadge) { fieldHelpBadge.remove(); fieldHelpBadge = null; }
+        document.removeEventListener("keydown", fieldHelpEscHandler);
+      }
+    }
+    function fieldHelpEscHandler(e) { if (e.key === "Escape" && fieldHelpActive) toggleFieldHelp(); }
+  })();
+
+  // ── Conversation History panel wiring (§23) ────────────
+  (function () {
+    const historyBtn   = document.getElementById("af-history-btn");
+    const historyPanel = document.getElementById("af-history-panel");
+    const historyList  = document.getElementById("af-history-list");
+    const searchInput  = document.getElementById("af-history-search");
+    const closeBtn     = document.getElementById("af-history-close");
+    const newBtn       = document.getElementById("af-history-new");
+    if (!historyBtn || !historyPanel) return;
+
+    function fmtTime(ts) {
+      const d = new Date(ts);
+      const now = new Date();
+      const sameDay = d.toDateString() === now.toDateString();
+      return sameDay
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : d.toLocaleDateString([], { month: "short", day: "numeric" });
+    }
+
+    function renderHistoryList(filterText) {
+      const q = (filterText || "").toLowerCase().trim();
+      const activeId = sessionStorage.getItem(CUR_CONV_ID_KEY);
+      let items = getArchive();
+      if (q) {
+        items = items.filter(c =>
+          c.title.toLowerCase().includes(q) ||
+          c.messages.some(m => m.html.replace(/<[^>]+>/g, "").toLowerCase().includes(q))
+        );
+      }
+      if (!items.length) {
+        historyList.innerHTML = `<div class="af-hist-empty">No conversations ${q ? "match that search" : "yet"}.</div>`;
+        return;
+      }
+      historyList.innerHTML = items.map(c => `
+        <div class="af-hist-item" data-id="${c.id}" style="${c.id === activeId ? "background:#f0f4ff;" : ""}">
+          <span class="af-hist-btn af-hist-pin" data-id="${c.id}" title="${c.pinned ? "Unpin" : "Pin"}">${c.pinned ? "📌" : "📍"}</span>
+          <span class="af-hist-title">${escHtml(c.title)}</span>
+          <span class="af-hist-time">${fmtTime(c.updatedAt)}</span>
+          ${MVP_FEATURES.shareConversation ? `<span class="af-hist-btn af-hist-share" data-id="${c.id}" title="Copy transcript">⇪</span>` : ""}
+          <span class="af-hist-btn af-hist-del" data-id="${c.id}" title="Delete">🗑️</span>
+        </div>`).join("");
+    }
+
+    function openHistory() { renderHistoryList(searchInput.value); historyPanel.classList.add("open"); }
+    function closeHistory() { historyPanel.classList.remove("open"); }
+
+    historyBtn.addEventListener("click", (e) => { e.stopPropagation(); openHistory(); });
+    closeBtn.addEventListener("click", closeHistory);
+    newBtn.addEventListener("click", () => { startNewConversation(); closeHistory(); });
+    searchInput.addEventListener("input", () => renderHistoryList(searchInput.value));
+
+    historyList.addEventListener("click", (e) => {
+      const id = e.target.getAttribute("data-id");
+      if (!id) return;
+      if (e.target.classList.contains("af-hist-pin")) {
+        togglePinConversation(id); renderHistoryList(searchInput.value); return;
+      }
+      if (e.target.classList.contains("af-hist-del")) {
+        deleteConversation(id); renderHistoryList(searchInput.value); return;
+      }
+      if (e.target.classList.contains("af-hist-share")) {
+        shareConversation(id).then(ok => {
+          e.target.textContent = ok ? "✓" : "⚠";
+          setTimeout(() => { e.target.textContent = "⇪"; }, 1200);
+        });
+        return;
+      }
+      // Row click (not on a sub-button) → resume that conversation
+      resumeConversation(id);
+      closeHistory();
+    });
+  })();
+
+  // ════════════════════════════════════════════════════════
+  // ── AUTH — JWT storage + screen management ────────────
+  // ════════════════════════════════════════════════════════
+  const AUTH_KEY = "af_auth_" + (API_KEY || "default");
+
+  function saveAuth(token, user, org) {
+    try { localStorage.setItem(AUTH_KEY, JSON.stringify({ token, user, org })); } catch {}
+  }
+  function loadAuth() {
+    try { return JSON.parse(localStorage.getItem(AUTH_KEY)); } catch { return null; }
+  }
+  function clearAuth() {
+    try { localStorage.removeItem(AUTH_KEY); } catch {}
+    widgetUser  = null;
+    widgetOrg   = null;
+    widgetToken = null;
+  }
+
+  // Decode JWT expiry without a library
+  function isTokenExpired(token) {
+    try {
+      const payload = JSON.parse(atob(token.split(".")[1]));
+      return payload.exp && Date.now() / 1000 > payload.exp;
+    } catch { return true; }
+  }
+
+  // Show/hide auth screen
+  function showAuthScreen(form) {
+    // form: 'login' | 'signup' | 'forgot'
+    document.getElementById("af-auth-screen").classList.remove("hidden");
+    document.getElementById("af-auth-login").style.display  = form === "login"  ? "flex" : "none";
+    document.getElementById("af-auth-signup").style.display = form === "signup" ? "flex" : "none";
+    document.getElementById("af-auth-forgot").style.display = form === "forgot" ? "flex" : "none";
+  }
+  function hideAuthScreen() {
+    document.getElementById("af-auth-screen").classList.add("hidden");
+  }
+
+  // Update the user chip in the header
+  function setUserChip(user) {
+    const chip    = document.getElementById("af-user-chip");
+    const initEl  = document.getElementById("af-uc-initials");
+    const nameEl  = document.getElementById("af-uc-name");
+    if (!chip) return;
+    if (!user) { chip.classList.remove("visible"); return; }
+    const initials = ((user.firstName || "")[0] + (user.lastName || "")[0]).toUpperCase() || "?";
+    initEl.textContent = initials;
+    nameEl.textContent = user.firstName || user.email;
+    chip.classList.add("visible");
+  }
+
+  // Auth error/success helpers
+  function showAuthError(prefix, msg) {
+    const el   = document.getElementById("af-" + prefix + "-error");
+    const span = document.getElementById("af-" + prefix + "-error-msg");
+    if (span) span.textContent = msg;
+    if (el)   el.classList.add("visible");
+  }
+  function hideAuthError(prefix) {
+    const el = document.getElementById("af-" + prefix + "-error");
+    if (el) el.classList.remove("visible");
+  }
+  function showAuthSuccess(prefix) {
+    const el = document.getElementById("af-" + prefix + "-success");
+    if (el) el.classList.add("visible");
+  }
+
+  // Called after successful login or signup — hand off to init()
+  function onAuthSuccess(token, user, org, serverHistory) {
+    saveAuth(token, user, org);
+    widgetUser  = user;
+    widgetOrg   = org;
+    widgetToken = token;
+    hideAuthScreen();
+    setUserChip(user);
+    // Seed the local Conversation History archive with what the server has
+    // for this user (cross-device), without force-overwriting whatever's
+    // currently on screen — it just becomes a resumable entry the user can
+    // open from the History panel.
+    if (Array.isArray(serverHistory) && serverHistory.length) {
+      try {
+        const asWidgetMsgs = serverHistory.map(m => ({
+          type: m.role === "assistant" ? "agent" : "user",
+          html: escHtml(m.content || "")
+        }));
+        const archive = getArchive();
+        const id = "server_" + (user?.id || "sync");
+        const idx = archive.findIndex(c => c.id === id);
+        const entry = {
+          id, title: "Synced from your account", updatedAt: Date.now(),
+          pinned: idx !== -1 ? !!archive[idx].pinned : false, messages: asWidgetMsgs
+        };
+        if (idx !== -1) archive[idx] = entry; else archive.unshift(entry);
+        setArchive(archive);
+      } catch {}
+    }
+    // Update the Authorization header going forward
+    init();
+  }
+
+  // ── Sync new turns to server-side history (cross-device) ─────────────────
+  // Fire-and-forget, only when logged in (widgetToken set). Tracks how much
+  // of conversationHistory has already been pushed so we don't resend turns.
+  let _historySyncedLen = 0;
+  async function syncHistoryToServer() {
+    if (!widgetToken) return;
+    const fresh = conversationHistory.slice(_historySyncedLen)
+      .filter(m => m.type === "user" || m.type === "agent")
+      .map(m => ({ role: m.type === "agent" ? "assistant" : "user", content: (m.html || "").replace(/<[^>]+>/g, "").trim() }))
+      .filter(t => t.content);
+    if (!fresh.length) return;
+    _historySyncedLen = conversationHistory.length;
+    try {
+      await fetch(BACKEND_URL + "/api/user/history", {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ turns: fresh })
+      });
+    } catch { /* best-effort — local archive still has it */ }
+  }
+
+  // ── Navigation between auth forms ─────────────────────
+  document.getElementById("af-goto-signup").addEventListener("click", () => {
+    hideAuthError("login"); showAuthScreen("signup");
+  });
+  document.getElementById("af-goto-login").addEventListener("click", () => {
+    hideAuthError("signup"); showAuthScreen("login");
+  });
+  document.getElementById("af-goto-forgot").addEventListener("click", () => {
+    hideAuthError("login"); showAuthScreen("forgot");
+  });
+  document.getElementById("af-goto-login2").addEventListener("click", () => {
+    hideAuthError("forgot"); showAuthScreen("login");
+  });
+
+  // ── Login submit ───────────────────────────────────────
+  async function doLogin() {
+    hideAuthError("login");
+    const email    = document.getElementById("af-login-email").value.trim();
+    const password = document.getElementById("af-login-password").value;
+    const btn      = document.getElementById("af-login-btn");
+    if (!email || !password) { showAuthError("login", "Please enter your email and password."); return; }
+    btn.disabled = true;
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;animation:af-spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0"/></svg> Signing in...`;
+    try {
+      const res  = await fetch(BACKEND_URL + "/api/user/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+        body:   JSON.stringify({ apiKey: API_KEY, email, password })
+      });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { throw new Error(res.status === 404 ? "Auth routes not found on server — please redeploy the backend with the latest code." : `Server error (${res.status}). Please try again.`); }
+      if (!data.success) throw new Error(data.error || "Login failed.");
+      onAuthSuccess(data.token, data.user, data.org, data.history);
+    } catch (err) {
+      showAuthError("login", err.message);
+      btn.disabled = false;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:14px;height:14px;"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> Sign in`;
+    }
+  }
+  document.getElementById("af-login-btn").addEventListener("click", doLogin);
+  document.getElementById("af-login-password").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+  document.getElementById("af-login-email").addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("af-login-password").focus(); });
+
+  // ── Signup submit ──────────────────────────────────────
+  async function doSignup() {
+    hideAuthError("signup");
+    const firstName = document.getElementById("af-signup-first").value.trim();
+    const lastName  = document.getElementById("af-signup-last").value.trim();
+    const email     = document.getElementById("af-signup-email").value.trim();
+    const password  = document.getElementById("af-signup-password").value;
+    const btn       = document.getElementById("af-signup-btn");
+    if (!firstName || !lastName || !email || !password) {
+      showAuthError("signup", "All fields are required."); return;
+    }
+    if (password.length < 8) { showAuthError("signup", "Password must be at least 8 characters."); return; }
+    btn.disabled = true;
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;animation:af-spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0"/></svg> Creating account...`;
+    try {
+      const res  = await fetch(BACKEND_URL + "/api/user/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+        body:   JSON.stringify({ apiKey: API_KEY, firstName, lastName, email, password })
+      });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { throw new Error(res.status === 404 ? "Auth routes not found — please redeploy the backend." : `Server error (${res.status}).`); }
+      if (!data.success) throw new Error(data.error || "Signup failed.");
+      showAuthSuccess("signup");
+      setTimeout(() => onAuthSuccess(data.token, data.user, data.org, data.history), 1200);
+    } catch (err) {
+      showAuthError("signup", err.message);
+      btn.disabled = false;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:14px;height:14px;"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg> Create account`;
+    }
+  }
+  document.getElementById("af-signup-btn").addEventListener("click", doSignup);
+
+  // ── Forgot password submit ─────────────────────────────
+  async function doForgot() {
+    hideAuthError("forgot");
+    const email = document.getElementById("af-forgot-email").value.trim();
+    const btn   = document.getElementById("af-forgot-btn");
+    if (!email) { showAuthError("forgot", "Please enter your email address."); return; }
+    btn.disabled = true;
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;animation:af-spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0"/></svg> Sending...`;
+    try {
+      const res  = await fetch(BACKEND_URL + "/api/user/forgot-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+        body:   JSON.stringify({ apiKey: API_KEY, email })
+      });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { throw new Error(res.status === 404 ? "Auth routes not found — please redeploy the backend." : `Server error (${res.status}).`); }
+      if (data.success) {
+        showAuthSuccess("forgot");
+        btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><polyline points="20 6 9 17 4 12"/></svg> Email sent`;
+      } else {
+        throw new Error(data.error || "Request failed.");
+      }
+    } catch (err) {
+      showAuthError("forgot", err.message);
+      btn.disabled = false;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:14px;height:14px;"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg> Send reset link`;
+    }
+  }
+  document.getElementById("af-forgot-btn").addEventListener("click", doForgot);
+
+  // ── User chip toggle (dropdown) ────────────────────────
+  document.getElementById("af-user-chip").addEventListener("click", (e) => {
+    e.stopPropagation();
+    document.getElementById("af-user-menu").classList.toggle("open");
+  });
+  document.addEventListener("click", () => {
+    document.getElementById("af-user-menu")?.classList.remove("open");
+  });
+  document.getElementById("af-um-logout").addEventListener("click", () => {
+    if (!confirm("Sign out?")) return;
+    clearAuth();
+    clearSession();
+    document.getElementById("af-user-menu").classList.remove("open");
+    // Clear the messages area and show auth screen
+    document.getElementById("af-messages").innerHTML = '<div class="af-msg thinking">Sign in to continue...</div>';
+    setUserChip(null);
+    showAuthScreen("login");
+  });
+
+  // ── Spin keyframe (for loading spinners) ──────────────
+  if (!document.getElementById("af-spin-style")) {
+    const ss = document.createElement("style");
+    ss.id = "af-spin-style";
+    ss.textContent = "@keyframes af-spin { to { transform: rotate(360deg); } }";
+    document.head.appendChild(ss);
+  }
+  function saveSession() {
+    try {
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({
+        history: conversationHistory.slice(-40), clientInfo
+      }));
+    } catch (e) {}
+    archiveCurrentSession();
+    syncHistoryToServer();
+  }
+  function loadSession() {
+    try { return JSON.parse(sessionStorage.getItem(SESSION_KEY)); } catch { return null; }
+  }
+  function clearSession() {
+    try { sessionStorage.removeItem(SESSION_KEY); } catch {}
+    conversationHistory = [];
+  }
+
+  // ── Conversation History archive (§23) ────────────────
+  // Cross-session, cross-reload archive of past conversations stored in
+  // localStorage: resumable, searchable, pinnable. Independent of the
+  // sessionStorage "current tab" snapshot above.
+  const ARCHIVE_KEY = "af_archive_" + (API_KEY || "default");
+  const CUR_CONV_ID_KEY = "af_cur_conv_" + (API_KEY || "default");
+
+  function getArchive() {
+    try { return JSON.parse(localStorage.getItem(ARCHIVE_KEY) || "[]"); } catch { return []; }
+  }
+  function setArchive(list) {
+    try { localStorage.setItem(ARCHIVE_KEY, JSON.stringify(list.slice(0, 40))); } catch {}
+  }
+  function currentConvId() {
+    let id = sessionStorage.getItem(CUR_CONV_ID_KEY);
+    if (!id) {
+      id = "conv_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+      sessionStorage.setItem(CUR_CONV_ID_KEY, id);
+    }
+    return id;
+  }
+  function conversationTitle(history) {
+    const firstUser = history.find(m => m.type === "user");
+    if (!firstUser) return "New conversation";
+    return firstUser.html.replace(/<[^>]+>/g, "").trim().slice(0, 60) || "New conversation";
+  }
+  // Upserts the current in-memory conversation into the archive. Cheap and
+  // called on every saveSession() so the archive always reflects live state.
+  function archiveCurrentSession() {
+    if (!conversationHistory.length) return;
+    const id = currentConvId();
+    const archive = getArchive();
+    const idx = archive.findIndex(c => c.id === id);
+    const entry = {
+      id,
+      title: conversationTitle(conversationHistory),
+      updatedAt: Date.now(),
+      pinned: idx !== -1 ? !!archive[idx].pinned : false,
+      messages: conversationHistory.slice(-60)
+    };
+    if (idx !== -1) archive[idx] = entry; else archive.unshift(entry);
+    archive.sort((a, b) => (b.pinned - a.pinned) || (b.updatedAt - a.updatedAt));
+    setArchive(archive);
+  }
+  function startNewConversation() {
+    sessionStorage.removeItem(CUR_CONV_ID_KEY);
+    clearSession();
+    clearMessages();
+  }
+  function resumeConversation(id) {
+    const entry = getArchive().find(c => c.id === id);
+    if (!entry) return;
+    sessionStorage.setItem(CUR_CONV_ID_KEY, id);
+    conversationHistory = entry.messages.slice();
+    saveSession();
+    restoreMessages();
+  }
+  function togglePinConversation(id) {
+    const archive = getArchive();
+    const entry = archive.find(c => c.id === id);
+    if (!entry) return;
+    entry.pinned = !entry.pinned;
+    archive.sort((a, b) => (b.pinned - a.pinned) || (b.updatedAt - a.updatedAt));
+    setArchive(archive);
+  }
+  function deleteConversation(id) {
+    setArchive(getArchive().filter(c => c.id !== id));
+  }
+  async function shareConversation(id) {
+    const entry = getArchive().find(c => c.id === id);
+    if (!entry) return false;
+    const text = entry.messages
+      .filter(m => m.type === "user" || m.type === "agent")
+      .map(m => (m.type === "user" ? "You: " : "Assistant: ") + m.html.replace(/<[^>]+>/g, "").trim())
+      .join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch { return false; }
+  }
+
+  // ── Message helpers ───────────────────────────────────
+  function addMsg(type, html, persist = true) {
+    const msgs = document.getElementById("af-messages");
+    const el   = document.createElement("div");
+    el.className = "af-msg " + type;
+    el.innerHTML = html;
+    msgs.appendChild(el);
+    requestAnimationFrame(() => { msgs.scrollTop = msgs.scrollHeight; });
+    if (persist && type !== "thinking") {
+      conversationHistory.push({ type, html, time: Date.now() });
+      saveSession();
+    }
+    return el;
+  }
+
+  function clearMessages() { document.getElementById("af-messages").innerHTML = ""; }
+
+  function restoreMessages() {
+    if (!conversationHistory.length) return false;
+    clearMessages();
+    const msgs = document.getElementById("af-messages");
+    conversationHistory.slice(-20).forEach(m => {
+      const el = document.createElement("div");
+      el.className = "af-msg " + m.type;
+      el.innerHTML = m.html;
+      msgs.appendChild(el);
+    });
+    msgs.scrollTop = msgs.scrollHeight;
+    return true;
+  }
+
+  // ════════════════════════════════════════════════════════
+  // ── FILE ATTACHMENT SYSTEM ────────────────────────────
+  // ════════════════════════════════════════════════════════
+
+  const fileInput  = document.getElementById("af-file-input");
+  const attachBtn  = document.getElementById("af-attach-btn");
+  const tray       = document.getElementById("af-attachment-tray");
+
+  const FILE_ICONS = {
+    pdf: "📄", doc: "📝", docx: "📝", txt: "📋",
+    csv: "📊", xlsx: "📊", xls: "📊", default: "📁"
+  };
+
+  function getFileIcon(name) {
+    const ext = name.split(".").pop().toLowerCase();
+    return FILE_ICONS[ext] || FILE_ICONS.default;
+  }
+
+  // Render the staging tray
+  function renderTray() {
+    tray.innerHTML = "";
+    if (attachments.length === 0) {
+      tray.classList.remove("has-items");
+      attachBtn.classList.remove("has-files");
+      return;
+    }
+    tray.classList.add("has-items");
+    attachBtn.classList.add("has-files");
+
+    attachments.forEach((att, idx) => {
+      const div = document.createElement("div");
+      div.className = "af-staged";
+
+      if (att.type.startsWith("image/")) {
+        div.innerHTML = `<img src="${att.dataUrl}" alt="${att.name}" />`;
+      } else {
+        div.innerHTML = `
+          <div class="af-staged-file">
+            <span class="af-si">${getFileIcon(att.name)}</span>
+            <span class="af-sn">${att.name}</span>
+          </div>`;
+      }
+
+      const rmBtn = document.createElement("button");
+      rmBtn.className   = "af-staged-remove";
+      rmBtn.textContent = "×";
+      rmBtn.title       = "Remove";
+      rmBtn.addEventListener("click", () => {
+        attachments.splice(idx, 1);
+        renderTray();
+      });
+      div.appendChild(rmBtn);
+      tray.appendChild(div);
+    });
+  }
+
+  fileInput.addEventListener("change", async () => {
+  const files = Array.from(fileInput.files);
+  for (const file of files) {
+    // Check if the file is an image
+    if (!file.type.startsWith("image/")) {
+      addMsg("warning", `⚠️ "${file.name}" is not an image and was skipped.`);
+      continue;
+    }
+    
+    if (file.size > 10 * 1024 * 1024) {
+      addMsg("warning", `⚠️ "${file.name}" is over 10 MB and was skipped.`);
+      continue;
+    }
+    const att = await readFile(file);
+    attachments.push(att);
+  }
+  renderTray();
+  fileInput.value = "";
+});
+
+  // Read file into base64 + extract text where possible
+  function readFile(file) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const dataUrl = e.target.result;
+        let text = null;
+
+        // For plain text / CSV, extract readable content to send to AI
+        if (file.type === "text/plain" || file.type === "text/csv" || file.name.endsWith(".csv")) {
+          text = atob(dataUrl.split(",")[1]);
+          if (text.length > 4000) text = text.slice(0, 4000) + "\n...[truncated]";
+        }
+
+        resolve({
+          name:    file.name,
+          type:    file.type || "application/octet-stream",
+          size:    file.size,
+          dataUrl, // base64 data URL
+          text     // plain text content (null for binary files)
+        });
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // ════════════════════════════════════════════════════════
+  // ── FILE STORAGE (localStorage) ──────────────────────
+  // ════════════════════════════════════════════════════════
+
+  const FILES_KEY = "af_files_" + API_KEY;
+
+  function loadStoredFiles() {
+    try { return JSON.parse(localStorage.getItem(FILES_KEY) || "[]"); }
+    catch { return []; }
+  }
+
+  function saveStoredFiles(files) {
+    try { localStorage.setItem(FILES_KEY, JSON.stringify(files.slice(0, 50))); }
+    catch (e) { console.warn("localStorage full — files not saved", e); }
+  }
+
+  function storeFile(name, url, mimeType, direction, size) {
+  const files = loadStoredFiles();
+  const already = files.findIndex(function(f) { return f.name === name && f.direction === direction; });
+  const entry = { name: name, url: url, mimeType: mimeType, direction: direction,
+                  time: Date.now(), size: size || 0 };
+  if (already >= 0) files[already] = entry;
+  else files.unshift(entry);
+  saveStoredFiles(files);
+  updateFilesBadge();
+}
+
+   function updateFilesBadge() {
+    const badge = document.getElementById("af-files-badge");
+    if (!badge) return;
+    // Fetch live count from server so badge is accurate after browser restarts
+    fetchWithTimeout(
+      `${BACKEND_URL}/api/agent/workspace?deviceId=${encodeURIComponent(deviceInfo.deviceId)}`,
+      { headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" } },
+      8000
+    )
+    .then(r => r.json())
+    .then(data => {
+      const count = (data.files || []).length;
+      if (count > 0) {
+        badge.style.display = "flex";
+        badge.textContent   = count > 9 ? "9+" : String(count);
+      } else {
+        badge.style.display = "none";
+      }
+    })
+    .catch(() => {
+      // Fallback to localStorage count if server is unreachable
+      const files = loadStoredFiles();
+      if (files.length > 0) {
+        badge.style.display = "flex";
+        badge.textContent   = files.length > 9 ? "9+" : String(files.length);
+      } else {
+        badge.style.display = "none";
+      }
+    });
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024)       return bytes + " B";
+    if (bytes < 1024*1024)  return (bytes/1024).toFixed(1) + " KB";
+    return (bytes/(1024*1024)).toFixed(1) + " MB";
+  }
+
+  function fpTimeAgo(ts) {
+    const diff = Date.now() - ts;
+    const m = Math.floor(diff / 60000);
+    const h = Math.floor(m / 60);
+    const d = Math.floor(h / 24);
+    if (m < 1)  return "just now";
+    if (m < 60) return m + "m ago";
+    if (h < 24) return h + "h ago";
+    return d + "d ago";
+  }
+
+  // ── New: Fetch and Render Files from Server ──────────
+// ── Active file panel tab: 'library' | 'workspace' ──
+  let filePanelTab = "library";
+
+  async function renderFilesPanel(tab) {
+    if (tab) filePanelTab = tab;
+    const list = document.getElementById("af-fp-list");
+    const notice = document.getElementById("af-fp-notice");
+    const noticeText = document.getElementById("af-fp-notice-text");
+
+    // Update tab active state
+    document.querySelectorAll(".af-fp-tab").forEach(t => {
+      t.classList.toggle("active", t.dataset.tab === filePanelTab);
+    });
+
+    if (filePanelTab === "library") {
+      notice.style.display = "flex";
+      noticeText.textContent = "Reference files shared by your organisation — available to download anytime";
+      list.innerHTML = '<div class="af-fp-loading" style="text-align:center;padding:20px;color:#888;font-size:13px;">Loading library...</div>';
+      try {
+        const res  = await fetchWithRetry(BACKEND_URL + "/api/agent/library", {
+          headers: authHeaders()
+        }, { timeout: adaptiveTimeout(12000), retries: 2 });
+        const data = await res.json();
+        if (!data.success || !data.files || data.files.length === 0) {
+          list.innerHTML = '<div class="af-fp-empty">No library files yet. Your admin can upload reference documents from the admin panel.</div>';
+          return;
+        }
+        list.innerHTML = data.files.map(f => `
+          <div class="af-fp-item">
+            <div class="af-fp-item-icon">${ICONS.file}</div>
+            <div class="af-fp-item-info">
+              <div class="af-fp-item-name">${escHtml(f.label || f.filename)}</div>
+              <div class="af-fp-item-meta">${f.size ? formatBytes(f.size) : ""} &nbsp;·&nbsp; ${f.uploadedAt ? new Date(f.uploadedAt).toLocaleDateString() : ""}</div>
+            </div>
+            <span class="af-lib-badge">Library</span>
+            <button class="af-fp-item-dl" onclick="afDownloadLibFile('${escHtml(f.filename)}')" title="Download">${ICONS.download}</button>
+          </div>`).join("");
+      } catch (err) {
+        list.innerHTML = '<div class="af-fp-empty">Could not load library — check your connection.</div>';
+      }
+
+    } else {
+      // Workspace tab
+      notice.style.display = "flex";
+      noticeText.textContent = "Files generated or shared in your AI chat sessions";
+      list.innerHTML = '<div class="af-fp-loading" style="text-align:center;padding:20px;color:#888;font-size:13px;">Loading workspace...</div>';
+      try {
+        const res  = await fetchWithRetry(`${BACKEND_URL}/api/agent/workspace?deviceId=${deviceInfo.deviceId}`, {
+          headers: authHeaders()
+        }, { timeout: adaptiveTimeout(12000), retries: 2 });
+        const data = await res.json();
+        if (!data.success || !data.files || data.files.length === 0) {
+          list.innerHTML = '<div class="af-fp-empty">No workspace files yet. Files the AI generates or you share will appear here.</div>';
+          return;
+        }
+        list.innerHTML = data.files.map(f => `
+          <div class="af-fp-item">
+            <div class="af-fp-item-icon">${ICONS.file}</div>
+            <div class="af-fp-item-info">
+              <div class="af-fp-item-name">${escHtml(f.name)}</div>
+              <div class="af-fp-item-meta">${formatBytes(f.size)}</div>
+            </div>
+            <button class="af-fp-item-dl" onclick="afDownloadFile('${escHtml(f.name)}')" title="Download">${ICONS.download}</button>
+            <button class="af-fp-delete" onclick="afDeleteFile('${escHtml(f.name)}')" title="Delete" style="padding:6px;background:none;border:none;cursor:pointer;color:#ccc;display:flex;align-items:center;">${ICONS.trash}</button>
+          </div>`).join("");
+      } catch (err) {
+        list.innerHTML = '<div class="af-fp-empty">Could not load workspace — check your connection.</div>';
+      }
+    }
+  }
+
+  // Library file download
+  window.afDownloadLibFile = function(filename) {
+    const url = `${BACKEND_URL}/api/agent/library/${encodeURIComponent(filename)}`;
+    // Use fetch with auth header, then blob-download
+    fetch(url, { headers: authHeaders() })
+      .then(r => r.blob())
+      .then(blob => {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      })
+      .catch(() => alert("Could not download file. Please try again."));
+  };
+
+// ── New: Delete Specific File ────────────────────────
+window.afDeleteFile = async function(filename) {
+    if (!confirm(`Are you sure you want to delete "${filename}"?`)) return;
+ 
+    try {
+      const res = await fetchWithRetry(`${BACKEND_URL}/api/agent/workspace/${encodeURIComponent(filename)}`, {
+        method: "DELETE",
+        headers: {
+          "x-api-key":    API_KEY,
+          "x-device-id":  deviceInfo.deviceId   // ← scopes deletion to this device's files only
+        }
+      }, { timeout: adaptiveTimeout(10000), retries: 1 });
+    
+    if (res.ok) {
+      renderFilesPanel();
+      updateFilesBadge();
+    } else {
+      alert("Failed to delete file. Please check your connection and try again.");
+    }
+  } catch (err) {
+    alert(err.name === "AbortError"
+      ? "Delete timed out. Please check your connection."
+      : "Failed to delete file.");
+    console.error("Delete error:", err);
+  }
+};
+
+// ── Update Download Helper ───────────────────────────
+window.afDownloadFile = function(filename) {
+    const downloadUrl = `${BACKEND_URL}/api/agent/workspace/${encodeURIComponent(filename)}` +
+      `?key=${encodeURIComponent(API_KEY)}&deviceId=${encodeURIComponent(deviceInfo.deviceId)}`;
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = filename;
+    a.target = "_blank";
+    a.click();
+  };
+
+  // ── Wire up files panel toggle ─────────────────────────
+  document.getElementById("af-files-btn").addEventListener("click", function() {
+    renderFilesPanel(filePanelTab || "library");
+    document.getElementById("af-files-panel").classList.add("open");
+  });
+  document.getElementById("af-fp-close").addEventListener("click", function() {
+    document.getElementById("af-files-panel").classList.remove("open");
+  });
+  document.getElementById("af-fp-clear").addEventListener("click", function() {
+    if (filePanelTab === "library") {
+      alert("Library files are managed by your administrator.");
+      return;
+    }
+    if (confirm("Clear all workspace files? This cannot be undone.")) {
+      localStorage.removeItem(FILES_KEY);
+      updateFilesBadge();
+      renderFilesPanel("workspace");
+    }
+  });
+
+  // Wire tab clicks
+  document.querySelectorAll(".af-fp-tab").forEach(btn => {
+    btn.addEventListener("click", () => renderFilesPanel(btn.dataset.tab));
+  });
+
+  // Init badge on load
+  updateFilesBadge();
+
+  // Build the attachment context string to inject into the AI message
+  function buildAttachmentContext(atts) {
+    if (!atts || atts.length === 0) return "";
+    let ctx = "\n\n[ATTACHED FILES]\n";
+    atts.forEach((att, i) => {
+      ctx += `File ${i+1}: "${att.name}" (${att.type}, ${(att.size/1024).toFixed(1)} KB)\n`;
+      if (att.text) ctx += `Content:\n${att.text}\n`;
+      else if (att.type.startsWith("image/")) ctx += `[Image file — analyze visually if possible]\n`;
+      else ctx += `[Binary file — name and type provided for context]\n`;
+    });
+    return ctx;
+  }
+
+  // Render attachment thumbnails inside a chat bubble
+  function renderAttachmentThumbs(atts) {
+    if (!atts || atts.length === 0) return "";
+    const thumbs = atts.map(att => {
+      if (att.type.startsWith("image/")) {
+        return `<div class="af-att-thumb"><img src="${att.dataUrl}" alt="${att.name}" /></div>`;
+      }
+      return `
+        <div class="af-att-thumb">
+          <div class="af-att-file">
+            <span class="af-att-icon">${getFileIcon(att.name)}</span>
+            <span class="af-att-name">${att.name}</span>
+          </div>
+        </div>`;
+    }).join("");
+    return `<div class="af-msg-attachments">${thumbs}</div>`;
+  }
+
+  // ════════════════════════════════════════════════════════
+  // ── VOICE NOTE WITH PREVIEW ───────────────────────────
+  // ════════════════════════════════════════════════════════
+
+  const micBtn       = document.getElementById("af-mic");
+  const voicePreview = document.getElementById("af-voice-preview");
+  const vpText       = document.getElementById("af-vp-text");
+  const vpSend       = document.getElementById("af-vp-send");
+  const vpDiscard    = document.getElementById("af-vp-discard");
+  const recordingBar = document.getElementById("af-recording-bar");
+  const recTimer     = document.getElementById("af-rec-timer");
+
+  // MVP scope: voice notes are hidden by default. The recording code
+  // underneath is untouched — this just keeps the entry point off the UI.
+  if (!MVP_FEATURES.voiceNotes && micBtn) micBtn.style.display = "none";
+
+  let recognition    = null;
+  let isRecording    = false;
+  let recInterval    = null;
+  let recSeconds     = 0;
+  let voiceTranscript = "";
+
+  // Show voice preview bar with transcript for editing
+  function showVoicePreview(text) {
+    vpText.value = text;
+    voicePreview.classList.add("visible");
+    vpText.focus();
+    vpText.select();
+  }
+
+  function hideVoicePreview() {
+    voicePreview.classList.remove("visible");
+    vpText.value = "";
+    voiceTranscript = "";
+  }
+
+  function startRecordingUI() {
+    isRecording = true;
+    recSeconds  = 0;
+    micBtn.classList.add("listening");
+    recordingBar.classList.add("visible");
+    hideVoicePreview();
+    recTimer.textContent = "0:00";
+    recInterval = setInterval(() => {
+      recSeconds++;
+      const m = Math.floor(recSeconds / 60);
+      const s = recSeconds % 60;
+      recTimer.textContent = m + ":" + (s < 10 ? "0" : "") + s;
+    }, 1000);
+  }
+
+  function stopRecordingUI() {
+    isRecording = false;
+    micBtn.classList.remove("listening");
+    recordingBar.classList.remove("visible");
+    clearInterval(recInterval);
+  }
+
+  if ("webkitSpeechRecognition" in window || "SpeechRecognition" in window) {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognition = new SR();
+    recognition.continuous      = false;
+    recognition.interimResults  = false;
+    recognition.lang            = "en-US";
+
+    recognition.onstart = () => startRecordingUI();
+
+    recognition.onend = () => {
+      stopRecordingUI();
+      if (voiceTranscript.trim()) {
+        // Show preview so user can edit before sending
+        showVoicePreview(voiceTranscript.trim());
+      }
+    };
+
+    recognition.onerror = () => {
+      stopRecordingUI();
+      addMsg("warning", "Could not capture voice. Try again or type your message.", false);
+    };
+
+    recognition.onresult = (e) => {
+      voiceTranscript = e.results[0][0].transcript;
+    };
+
+    micBtn.addEventListener("click", () => {
+      if (isProcessing) return;
+      if (isRecording) {
+        recognition.stop();
+      } else {
+        voiceTranscript = "";
+        hideVoicePreview();
+        recognition.start();
+      }
+    });
+
+  } else {
+    micBtn.style.opacity = "0.3";
+    micBtn.title = "Voice not supported in this browser";
+  }
+
+  // Voice preview send/discard
+  vpSend.addEventListener("click", () => {
+    const text = vpText.value.trim();
+    if (!text) return;
+    hideVoicePreview();
+    sendMessage(text);
+  });
+
+  vpText.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); vpSend.click(); }
+    if (e.key === "Escape") { hideVoicePreview(); }
+  });
+
+  vpDiscard.addEventListener("click", () => {
+    hideVoicePreview();
+    addMsg("agent", "Voice note discarded. Type or record again when you're ready.", false);
+  });
+
+  // ── Page scanner ──────────────────────────────────────
+  function scanPage() {
+    let idCounter = 0;
+    function afId(el) {
+      if (!el.dataset.afId) el.dataset.afId = "af_" + idCounter++;
+      return el.dataset.afId;
+    }
+    const buttons = [], inputs = [], links = [], tables = [];
+
+    document.querySelectorAll("button,[role='button'],input[type='button'],input[type='submit']").forEach(el => {
+      if (el.id === "af-launcher" || el.closest("#af-panel")) return;
+      const stepEl   = el.closest("[data-wizard-step]");
+      const stepInfo = stepEl ? " [wizard-step-" + stepEl.dataset.wizardStep + "]" : "";
+      buttons.push({
+        afId: afId(el), type: "button",
+        text: ((el.textContent || el.value || "").trim().slice(0, 60)) + stepInfo,
+        id: el.id || null, disabled: el.disabled
+      });
+    });
+
+    document.querySelectorAll("input:not([type='button']):not([type='submit']),textarea,select").forEach(el => {
+      if (el.id === "af-input" || el.id === "af-vp-text" || el.id === "af-file-input" || el.closest("#af-panel")) return;
+      const stepEl = el.closest("[data-wizard-step]");
+      const step   = stepEl ? parseInt(stepEl.dataset.wizardStep) : null;
+      const labelEl    = el.labels && el.labels[0] ? el.labels[0] : null;
+      const formGroup  = el.closest(".form-group");
+      const formLabel  = formGroup ? formGroup.querySelector(".form-label") : null;
+      inputs.push({
+        afId: afId(el), type: el.tagName.toLowerCase(),
+        placeholder: el.placeholder || null,
+        label: (labelEl ? labelEl.textContent.trim() : null) || (formLabel ? formLabel.textContent.trim() : null),
+        id: el.id || null, value: el.value || null,
+        wizardStep: step
+      });
+    });
+
+    document.querySelectorAll("a[href]").forEach(el => {
+      if (el.closest("#af-panel")) return;
+      links.push({ afId: afId(el), type: "link", text: el.textContent.trim().slice(0, 60), href: el.href || null });
+    });
+
+    document.querySelectorAll("table").forEach(table => {
+      if (table.closest("#af-panel")) return;
+      const headers = Array.from(table.querySelectorAll("th")).map(th => th.textContent.trim());
+      const rows = Array.from(table.querySelectorAll("tbody tr")).map(row => {
+        const badge = row.querySelector(".badge,.status");
+        return {
+          afId: afId(row), id: row.id || null,
+          cells: Array.from(row.querySelectorAll("td")).map(td => td.textContent.trim().slice(0, 60)),
+          status: badge ? badge.textContent.trim() : null
+        };
+      });
+      tables.push({ afId: afId(table), type: "table", id: table.id || null, headers, rows: rows.slice(0, 30) });
+    });
+
+    const headings = [];
+    document.querySelectorAll("h1,h2,h3,h4,[class*='title'],[class*='heading'],[class*='section-name']").forEach(el => {
+      if (el.closest("#af-panel")) return;
+      const text = el.textContent.trim().slice(0, 80);
+      if (text && text.length > 2) headings.push(text);
+    });
+
+    return { pageTitle: document.title, url: window.location.href, pageText: document.body.innerText.slice(0, 600), buttons, inputs, links, tables, headings };
+  }
+
+  // ── Action executor ───────────────────────────────────
+  async function executeActions(actions) {
+    // results[i] and auditDetails[i] are always in sync with actions[i]
+    // so the audit log is never assembled by fragile string-matching.
+    const results      = [];   // { ok, msg }          — for UI display
+    const auditDetails = [];   // { type, description, value, elementId, success, startedAt, completedAt }
+
+    // ── Helper: fire the confirm audit call ─────────────────────────────────
+    // Accepts a pre-built details array so navigate can fire before page unloads.
+    function fireAudit(detailsSnapshot) {
+      const operator = detectOperator();
+      fetchWithRetry(BACKEND_URL + "/api/agent/confirm", {
+        method:  "POST",
+        headers: { ...authHeaders({"Content-Type":"application/json"}) },
+        body: JSON.stringify({
+          command:       pendingPlan ? pendingPlan.originalCommand : "",
+          action:        pendingPlan ? pendingPlan.taskType        : "task",
+          pageTitle:     document.title,
+          pageUrl:       window.location.href,
+          rowCount:      detailsSnapshot.length,
+          results:       results.map(r => r.msg),
+          actionDetails: detailsSnapshot,
+          operator:      { detectedName: operator, source: operator ? "page-scrape" : "unknown" },
+          device:        deviceInfo,
+          sessionId:     SESSION_KEY
+        })
+      }, { timeout: 10000, retries: 2 }).catch(() => {});
+    }
+
+    for (let i = 0; i < actions.length; i++) {
+      const action    = actions[i];
+      const startedAt = new Date().toISOString();
+      await sleep(400);
+
+      let ok  = false;
+      let msg = "";
+
+      try {
+        let el = action.afId ? document.querySelector('[data-af-id="' + action.afId + '"]') : null;
+        if (!el && action.elementId) el = document.getElementById(action.elementId);
+        if (!el && action.selector)  el = document.querySelector(action.selector);
+        // Task Engine templates (deterministic, zero-LLM) describe targets by
+        // visible text rather than a live afId — reuse the same text-search
+        // the Guided Walkthrough uses to resolve those.
+        if (!el && action.elementHint) el = findByHint(action.elementHint);
+
+        if (!el && !["navigate","scroll","click_by_text"].includes(action.type)) {
+          ok  = false;
+          msg = "Could not find element for: <em>" + action.description + "</em>";
+          results.push({ ok, msg });
+          auditDetails.push({ type: action.type, description: action.description, value: action.value||null, elementId: action.elementId||null, success: false, startedAt, completedAt: new Date().toISOString() });
+          continue;
+        }
+
+        if (el) {
+          const origOutline = el.style.outline, origBg = el.style.background;
+          el.style.outline   = "2px solid " + theme.primary;
+          el.style.background = theme.light;
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          await sleep(350);
+          el.style.outline    = origOutline;
+          el.style.background = origBg;
+        }
+
+        if (action.type === "click") {
+          el.click();
+          ok  = true;
+          msg = "🖱️ Clicked <strong>" + action.description + "</strong>";
+          await sleep(600);
+
+        } else if (action.type === "click_by_text") {
+          const searchText = (action.value || action.description || "").toLowerCase().trim();
+          const allBtns    = Array.from(document.querySelectorAll("button,[role='button']")).filter(b => !b.closest("#af-panel"));
+          const match      = allBtns.find(b => b.textContent.trim().toLowerCase().includes(searchText));
+          if (match) {
+            match.scrollIntoView({ behavior: "smooth", block: "center" });
+            await sleep(300);
+            match.click();
+            ok  = true;
+            msg = `🖱️ Clicked "<strong>${match.textContent.trim().slice(0,40)}</strong>"`;
+            await sleep(700);
+          } else {
+            ok  = false;
+            msg = `⚠️ Could not find button with text: "${action.value}"`;
+          }
+
+        } else if (action.type === "fill") {
+          el.focus();
+          el.value = action.value;
+          el.dispatchEvent(new Event("input",  { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          ok  = true;
+          msg = `✏️ Filled <strong>${action.description}</strong> → "${action.value}"`;
+
+        } else if (action.type === "select") {
+          el.value = action.value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          ok  = true;
+          msg = `📋 Selected <strong>${action.description}</strong> → "${action.value}"`;
+
+        } else if (action.type === "approve_row") {
+          const btn = el.querySelector(".btn-approve,[class*='approve']") ||
+            Array.from(el.querySelectorAll("button")).find(b => /approve/i.test(b.textContent));
+          if (btn) { btn.click(); ok = true;  msg = `✅ Approved — <strong>${action.description}</strong>`; }
+          else      {             ok = false; msg = `⚠️ No approve button in row: <strong>${action.description}</strong>`; }
+
+        } else if (action.type === "reject_row") {
+          const btn = el.querySelector(".btn-reject,[class*='reject']") ||
+            Array.from(el.querySelectorAll("button")).find(b => /reject/i.test(b.textContent));
+          if (btn) { btn.click(); ok = true;  msg = `❌ Rejected — <strong>${action.description}</strong>`; }
+          else      {             ok = false; msg = `⚠️ No reject button in row: <strong>${action.description}</strong>`; }
+
+        } else if (action.type === "escalate_row") {
+          const btn = el.querySelector(".btn-escalate,[class*='escalate']") ||
+            Array.from(el.querySelectorAll("button")).find(b => /escalate|flag|hold/i.test(b.textContent));
+          if (btn) {
+            btn.click();
+            ok  = true;
+            msg = `⚠️ Escalated — <strong>${action.description}</strong>`;
+          } else {
+            el.style.background = "#fff8e1";
+            el.style.outline    = "2px solid #f57f17";
+            ok  = true;
+            msg = `⚠️ Flagged for escalation — <strong>${action.description}</strong>`;
+          }
+
+        } else if (action.type === "navigate") {
+          const remaining = actions.slice(i + 1);
+          if (remaining.length > 0) {
+            savePendingContinuation({
+              originalCommand: pendingPlan?.originalCommand || "",
+              taskType:        pendingPlan?.taskType        || "task",
+              stepsCompleted:  actions.slice(0, i).map(a => a.description).filter(Boolean),
+              stepsRemaining:  remaining.map(a => ({
+                description: a.description,
+                type:        a.type,
+                value:       a.value     || null,
+                elementId:   a.elementId || null
+              })),
+              fromPage: document.title,
+              fromUrl:  window.location.href
+            });
+          }
+
+          ok  = true;
+          msg = `🔗 Navigating to <strong>${action.description}</strong>…`;
+
+          // Record and show this action before the page unloads
+          results.push({ ok, msg });
+          auditDetails.push({ type: action.type, description: action.description, value: action.value||null, elementId: action.elementId||null, success: true, startedAt, completedAt: new Date().toISOString() });
+          addMsg("success", msg);
+
+          // ── Fire audit NOW — page is about to unload ─────────────────────
+          // Use sendBeacon as a best-effort guarantee that the log reaches the
+          // server even if the page tears down mid-fetch.
+          const auditPayload = JSON.stringify({
+            command:       pendingPlan ? pendingPlan.originalCommand : "",
+            action:        pendingPlan ? pendingPlan.taskType        : "task",
+            pageTitle:     document.title,
+            pageUrl:       window.location.href,
+            rowCount:      auditDetails.length,
+            results:       results.map(r => r.msg),
+            actionDetails: auditDetails,
+            operator:      { detectedName: detectOperator(), source: detectOperator() ? "page-scrape" : "unknown" },
+            device:        deviceInfo,
+            sessionId:     SESSION_KEY
+          });
+
+          const beaconSent = navigator.sendBeacon
+            ? navigator.sendBeacon(
+                BACKEND_URL + "/api/agent/confirm",
+                new Blob([auditPayload], { type: "application/json" })
+              )
+            : false;
+
+          // sendBeacon doesn't set custom headers — if it failed or isn't available,
+          // fall back to a regular fetch (may or may not complete before unload)
+          if (!beaconSent) {
+            fetchWithRetry(BACKEND_URL + "/api/agent/confirm", {
+              method:  "POST",
+              headers: { ...authHeaders({"Content-Type":"application/json"}) },
+              body:    auditPayload
+            }, { timeout: 5000, retries: 0 }).catch(() => {});
+          }
+
+          await sleep(300);
+          window.location.href = action.value;
+          return; // stop — page is unloading
+
+        } else if (action.type === "scroll") {
+          if (action.value === "top")    window.scrollTo({ top: 0, behavior: "smooth" });
+          if (action.value === "bottom") window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+          if (action.value === "down")   window.scrollBy({ top: 300, behavior: "smooth" });
+          if (action.value === "up")     window.scrollBy({ top: -300, behavior: "smooth" });
+          ok  = true;
+          msg = `↕️ Scrolled <strong>${action.value}</strong>`;
+
+        } else {
+          ok  = false;
+          msg = "Unknown action type: " + action.type;
+        }
+
+      } catch (err) {
+        ok  = false;
+        msg = "Error: " + err.message;
+      }
+
+      results.push({ ok, msg });
+      auditDetails.push({
+        type:        action.type,
+        description: action.description,
+        value:       action.value     || null,
+        elementId:   action.elementId || null,
+        success:     ok,
+        startedAt,
+        completedAt: new Date().toISOString()
+      });
+    }
+
+    // ── Display results ────────────────────────────────────────────────────
+    const okMsgs  = results.filter(r => r.ok);
+    const errMsgs = results.filter(r => !r.ok);
+    if (okMsgs.length)  addMsg("success", okMsgs.map(r => r.msg).join("<br>"));
+    if (errMsgs.length) addMsg("error",   errMsgs.map(r => r.msg).join("<br>"));
+
+    // ── Audit trail (fire-and-forget) ──────────────────────────────────────
+    fireAudit(auditDetails);
+  }
+
+  // ── Confirm card ──────────────────────────────────────
+  // ── File result display ─────────────────────────────
+  // Shows step-by-step tool progress, final answer, and download buttons
+  function showFileResult(steps, finalReply, downloadables) {
+    const msgs = document.getElementById("af-messages");
+
+    if (steps.length > 0) {
+      const card = document.createElement("div");
+      card.className = "af-file-steps";
+
+      const stepsHtml = steps.map(s => {
+        const ok      = !s.result?.startsWith("Error:");
+        const icon    = ok ? "✅" : "❌";
+        const preview = s.result ? s.result.split("\n")[0].slice(0, 80) : "";
+        return "<div class=\"af-fstep\">" +
+          "<span class=\"af-fstep-icon\">" + icon + "</span>" +
+          "<div class=\"af-fstep-body\">" +
+            "<div class=\"af-fstep-label\">" + s.label + "</div>" +
+            (preview ? "<div class=\"af-fstep-preview\">" + escHtml(preview) + "</div>" : "") +
+          "</div></div>";
+      }).join("");
+
+      card.innerHTML = "<div class=\"af-fsteps-header\">⚙️ " + steps.length + " step" + (steps.length > 1 ? "s" : "") + " completed</div>" +
+        "<div class=\"af-fsteps-list\">" + stepsHtml + "</div>";
+      msgs.appendChild(card);
+    }
+
+    // Final answer bubble
+    if (finalReply?.trim()) {
+      addMsg("agent", renderAgentReply(finalReply, null));
+    }
+
+    // Download buttons for any files produced
+    if (downloadables && downloadables.length > 0) {
+  downloadables.forEach(dl => {
+    // Store lightweight metadata — no file bytes in the browser
+    storeFile(dl.filename, dl.url || "", dl.mimeType || "application/octet-stream", "received", dl.size || 0);
+
+    const ext   = dl.filename.split(".").pop().toLowerCase();
+    const icons = { pdf:"📄", doc:"📝", docx:"📝", txt:"📋", csv:"📊", xlsx:"📊", xls:"📊", default:"📁" };
+    const icon  = icons[ext] || icons.default;
+    const card  = document.createElement("div");
+    card.className = "af-download-card";
+    card.innerHTML =
+      "<div class=\"af-dl-label\">📥 File ready</div>" +
+      "<div class=\"af-dl-file\">" +
+        "<span class=\"af-dl-icon\" style=\"color:${theme.primary}\">" + ICONS.file + "</span>" +
+        "<div class=\"af-dl-info\">" +
+          "<div class=\"af-dl-name\">" + escHtml(dl.filename) + "</div>" +
+          "<div class=\"af-dl-size\">" + formatBytes(dl.size || 0) + "</div>" +
+        "</div>" +
+        "<button class=\"af-dl-btn\">" + ICONS.download + " Download</button>" +
+      "</div>";
+    card.querySelector(".af-dl-btn").addEventListener("click", () => {
+        const downloadUrl = BACKEND_URL + dl.url +
+          "?key=" + encodeURIComponent(API_KEY) +
+          "&deviceId=" + encodeURIComponent(deviceInfo.deviceId);
+        const a = document.createElement("a");
+        a.href = downloadUrl; a.download = dl.filename; a.target = "_blank"; a.click();
+      });
+    msgs.appendChild(card);
+  });
+  updateFilesBadge();
+}
+
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function escHtml(str) {
+    return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  // ── Feedback system (👍 / 👎 / 🚩 report) ──────────────
+  // Attached to every agent reply. Fire-and-forget POST — never blocks or
+  // interrupts the chat if it fails.
+  let _feedbackSeq = 0;
+  async function sendFeedback(messageId, vote, replyText, userMessage, reportReason) {
+    try {
+      await fetch(BACKEND_URL + "/api/agent/feedback", {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ messageId, vote, replyText, userMessage, reportReason, device: deviceInfo })
+      });
+    } catch { /* best-effort — don't disrupt the conversation */ }
+  }
+
+  // ── AI reply sanitizer ────────────────────────────────
+  // The `reply` field comes from the LLM and must never be trusted as-is
+  // before being set via innerHTML. Allowlist a small set of formatting
+  // tags and strip everything else, including all attributes (so no
+  // href/src/on* handlers can sneak through via an allowed tag either).
+  const SANITIZE_ALLOWED_TAGS = new Set(["STRONG", "B", "EM", "UL", "OL", "LI", "BR", "P"]);
+  function sanitizeAgentHtml(html) {
+    const template = document.createElement("template");
+    template.innerHTML = String(html || "");
+
+    function clean(node) {
+      // Walk a static copy of childNodes since we mutate as we go.
+      Array.from(node.childNodes).forEach(child => {
+        if (child.nodeType === Node.TEXT_NODE) {
+          return; // text is always safe
+        }
+        if (child.nodeType !== Node.ELEMENT_NODE) {
+          child.remove(); // comments, etc.
+          return;
+        }
+        if (!SANITIZE_ALLOWED_TAGS.has(child.tagName)) {
+          // Disallowed tag (includes script/style/img/a/iframe/svg/etc.
+          // and any event-handler-bearing element): drop the tag but
+          // keep its text content, then continue cleaning inside it in
+          // case of nested disallowed tags before replacing.
+          clean(child);
+          const frag = document.createDocumentFragment();
+          while (child.firstChild) frag.appendChild(child.firstChild);
+          child.replaceWith(frag);
+          return;
+        }
+        // Allowed tag: strip every attribute (no href/src/on* etc.), then
+        // recurse into its children.
+        Array.from(child.attributes).forEach(attr => child.removeAttribute(attr.name));
+        clean(child);
+      });
+    }
+    clean(template.content);
+    return template.innerHTML;
+  }
+
+  // Wraps an agent reply with feedback controls and optional follow-up
+  // suggestion chips (from response.suggestions). Returns the full HTML
+  // string ready to pass into addMsg("agent", html).
+  function renderAgentReply(replyText, suggestions, lastUserMessage) {
+    const safeText = sanitizeAgentHtml(replyText || "Done.");
+    const msgId = "af-msg-" + (++_feedbackSeq) + "-" + Date.now();
+    let html = `<div class="af-reply-body">${safeText}</div>`;
+    html += `<div class="af-feedback-row" data-msg-id="${msgId}">` +
+      `<button class="af-fb-btn" data-vote="up" title="Helpful">👍</button>` +
+      `<button class="af-fb-btn" data-vote="down" title="Not helpful">👎</button>` +
+      `<button class="af-fb-btn" data-vote="report" title="Report incorrect">🚩</button>` +
+      `<button class="af-fb-btn af-copy-btn" title="Copy response">⧉</button>` +
+      `<span class="af-fb-thanks" style="display:none;">Thanks for the feedback</span>` +
+      `</div>`;
+    if (Array.isArray(suggestions) && suggestions.length) {
+      html += `<div class="af-suggestions">` + suggestions.slice(0, 3).map(s =>
+        `<button class="af-suggestion-chip" data-suggestion="${escHtml(s)}">${escHtml(s)}</button>`
+      ).join("") + `</div>`;
+    }
+    // Stash raw text/user message on the row via data attrs for the report flow
+    return html.replace(
+      `data-msg-id="${msgId}"`,
+      `data-msg-id="${msgId}" data-reply-text="${escHtml(safeText.replace(/<[^>]+>/g, "").slice(0, 2000))}" data-user-message="${escHtml((lastUserMessage || "").slice(0, 500))}"`
+    );
+  }
+
+  // Event delegation for feedback buttons + suggestion chips, since replies
+  // are added dynamically via innerHTML.
+  document.addEventListener("click", function (e) {
+    const copyBtn = e.target.closest(".af-copy-btn");
+    if (copyBtn) {
+      const row = copyBtn.closest(".af-feedback-row");
+      const text = row?.getAttribute("data-reply-text") || "";
+      navigator.clipboard?.writeText(text).then(() => {
+        const orig = copyBtn.textContent;
+        copyBtn.textContent = "✓";
+        setTimeout(() => { copyBtn.textContent = orig; }, 1200);
+      }).catch(() => {});
+      return;
+    }
+
+    const fbBtn = e.target.closest(".af-fb-btn[data-vote]");
+    if (fbBtn) {
+      const row = fbBtn.closest(".af-feedback-row");
+      if (!row || row.classList.contains("af-fb-done")) return;
+      const vote        = fbBtn.getAttribute("data-vote");
+      const msgId       = row.getAttribute("data-msg-id");
+      const replyText   = row.getAttribute("data-reply-text") || "";
+      const userMessage = row.getAttribute("data-user-message") || "";
+      if (vote === "report") {
+        const reason = window.prompt("What was wrong with this response? (optional)") || "";
+        sendFeedback(msgId, "report", replyText, userMessage, reason);
+      } else {
+        sendFeedback(msgId, vote, replyText, userMessage);
+      }
+      row.classList.add("af-fb-done");
+      row.querySelectorAll(".af-fb-btn").forEach(b => b.disabled = true);
+      if (vote !== "report") {
+        const thanks = row.querySelector(".af-fb-thanks");
+        if (thanks) thanks.style.display = "inline";
+      }
+      return;
+    }
+
+    const chip = e.target.closest(".af-suggestion-chip");
+    if (chip) {
+      const text = chip.getAttribute("data-suggestion");
+      if (text && !isProcessing && botActive) {
+        if (!panel.classList.contains("open")) openPanel();
+        sendMessage(text);
+      }
+    }
+  });
+
+  // ── Guided Walkthrough Mode (§4) ──────────────────────
+  // Renders an intro card, then a persistent step banner. Each step
+  // optionally highlights a matching element on the HOST page (by visible
+  // text, via elementHint) and auto-advances when the user clicks it;
+  // otherwise the user advances manually with "Next". State is kept in
+  // sessionStorage so a walkthrough survives a page navigation.
+  const WALKTHROUGH_KEY = "af_walkthrough_" + (API_KEY || "default");
+
+  function findByHint(hint) {
+    if (!hint) return null;
+    const needle = hint.toLowerCase().trim();
+    const candidates = Array.from(document.querySelectorAll(
+      "button, a, [role='button'], input, select, textarea, label"
+    )).filter(el => !el.closest("#af-panel") && !el.closest("#af-cmdk-overlay"));
+    return candidates.find(el => {
+      const txt = (el.textContent || el.value || el.placeholder || el.getAttribute("aria-label") || "").toLowerCase().trim();
+      return txt && txt.includes(needle);
+    }) || null;
+  }
+
+  function highlightWalkthroughTarget(hint, onAdvance) {
+    const el = findByHint(hint);
+    if (!el) return false;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    const origOutline = el.style.outline, origBg = el.style.background;
+    el.style.outline = "3px solid #f57f17";
+    el.style.outlineOffset = "2px";
+    el.style.background = "#fff8e1";
+    const cleanup = () => { el.style.outline = origOutline; el.style.background = origBg; };
+    const handler = () => { cleanup(); el.removeEventListener("click", handler); onAdvance(); };
+    el.addEventListener("click", handler, { once: true });
+    // Stash cleanup so we can remove the highlight if the user clicks "Next" instead
+    el.__afWtCleanup = () => { cleanup(); el.removeEventListener("click", handler); };
+    return el;
+  }
+
+  let _wtActiveEl = null;
+
+  function renderWalkthroughStep(steps, idx) {
+    if (_wtActiveEl?.__afWtCleanup) _wtActiveEl.__afWtCleanup();
+    _wtActiveEl = null;
+
+    const banner = document.getElementById("af-wt-banner");
+    if (!banner) return;
+    if (idx >= steps.length) {
+      banner.innerHTML = `<div class="af-wt-done">✅ Walkthrough complete!</div>`;
+      setTimeout(() => { banner.remove(); sessionStorage.removeItem(WALKTHROUGH_KEY); }, 1800);
+      return;
+    }
+    const step = steps[idx];
+    sessionStorage.setItem(WALKTHROUGH_KEY, JSON.stringify({ steps, idx }));
+
+    banner.innerHTML = `
+      <div class="af-wt-progress">Step ${idx + 1} of ${steps.length}</div>
+      <div class="af-wt-instruction">${escHtml(step.instruction || step.description || "")}</div>
+      <div class="af-wt-controls">
+        <button class="af-wt-btn af-wt-exit">Exit</button>
+        <button class="af-wt-btn af-wt-next">${idx === steps.length - 1 ? "Finish" : "Next →"}</button>
+      </div>`;
+
+    const advance = () => renderWalkthroughStep(steps, idx + 1);
+    if (step.elementHint) {
+      _wtActiveEl = highlightWalkthroughTarget(step.elementHint, advance);
+    }
+    banner.querySelector(".af-wt-next").addEventListener("click", advance);
+    banner.querySelector(".af-wt-exit").addEventListener("click", () => {
+      if (_wtActiveEl?.__afWtCleanup) _wtActiveEl.__afWtCleanup();
+      banner.remove();
+      sessionStorage.removeItem(WALKTHROUGH_KEY);
+    });
+  }
+
+  function showWalkthroughCard(reply, steps) {
+    if (!Array.isArray(steps) || !steps.length) {
+      addMsg("agent", renderAgentReply(reply || "I don't have clear steps for that yet.", null));
+      return;
+    }
+    addMsg("agent", renderAgentReply(
+      (reply || "Here's a step-by-step walkthrough:") +
+      `<ol class="af-wt-overview">` + steps.map(s => `<li>${escHtml(s.description || s.instruction || "")}</li>`).join("") + `</ol>`,
+      null
+    ));
+    let banner = document.getElementById("af-wt-banner");
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "af-wt-banner";
+      document.getElementById("af-panel").appendChild(banner);
+    }
+    renderWalkthroughStep(steps, 0);
+  }
+
+  // Resume an in-progress walkthrough after a page reload/navigation
+  (function resumeWalkthrough() {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(WALKTHROUGH_KEY) || "null");
+      if (saved?.steps?.length) {
+        let banner = document.getElementById("af-wt-banner");
+        if (!banner) {
+          banner = document.createElement("div");
+          banner.id = "af-wt-banner";
+          document.getElementById("af-panel")?.appendChild(banner);
+        }
+        renderWalkthroughStep(saved.steps, saved.idx || 0);
+      }
+    } catch {}
+  })();
+
+  function showConfirmCard(reply, plan) {
+    pendingPlan = plan;
+    const actions = plan.actions || [];
+
+    // Split reply: first line = goal, remaining lines = display rows
+    var lines    = (reply || "").split("\n").map(function(l){ return l.trim(); }).filter(Boolean);
+    var goal     = lines[0] || "Ready to execute.";
+    var rowLines = lines.slice(1);
+
+    // Fallback: derive rows from unique action descriptions if AI gave none
+    if (rowLines.length === 0) {
+      var seen = {};
+      rowLines = actions.map(function(a){ return a.description; })
+        .filter(function(d){ if (!d || seen[d]) return false; seen[d]=1; return true; })
+        .slice(0, 10);
+    }
+
+    // Split leading emoji from rest of text for icon/text columns
+    function splitEmoji(str) {
+      if (!str) return { icon: "▸", text: "" };
+      var cp = str.codePointAt(0);
+      if (cp > 127) {
+        var ch = String.fromCodePoint(cp);
+        return { icon: ch, text: str.slice(ch.length).trim() };
+      }
+      return { icon: "▸", text: str };
+    }
+
+    var rowsHtml = rowLines.map(function(r) {
+      var parts = splitEmoji(r);
+      return "<div class=\"af-confirm-row\">" +
+        "<span class=\"af-confirm-row-icon\">" + parts.icon + "</span>" +
+        "<span class=\"af-confirm-row-text\">" + escHtml(parts.text) + "</span>" +
+        "</div>";
+    }).join("");
+
+    var card = document.createElement("div");
+    card.className = "af-confirm-card";
+    card.innerHTML =
+      "<div class=\"af-confirm-header\">" +
+        "<span class=\"af-confirm-header-label\">Planned Action</span>" +
+        "<span class=\"af-confirm-header-count\">" + actions.length + " step" + (actions.length !== 1 ? "s" : "") + "</span>" +
+      "</div>" +
+      "<div class=\"af-confirm-goal\">" + escHtml(goal) + "</div>" +
+      (rowsHtml ? "<div class=\"af-confirm-rows\">" + rowsHtml + "</div>" : "") +
+      "<div class=\"af-confirm-btns\">" +
+        "<button class=\"af-btn-yes\" type=\"button\">Confirm</button>" +
+        "<button class=\"af-btn-no\"  type=\"button\">Cancel</button>" +
+      "</div>";
+
+    var msgs = document.getElementById("af-messages");
+    msgs.appendChild(card);
+    // Use setTimeout so the card is fully painted before we scroll it into view
+    setTimeout(function() {
+      card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 60);
+    setInputLocked(true);
+
+    card.querySelector(".af-btn-yes").addEventListener("click", async function() {
+      card.querySelector(".af-btn-yes").disabled = true;
+      card.querySelector(".af-btn-no").disabled  = true;
+      card.querySelector(".af-confirm-header").innerHTML =
+        "<span class=\"af-confirm-header-label\">⏳ Executing...</span>" +
+        "<span class=\"af-confirm-header-count\">please wait</span>";
+      await executeActions(plan.actions || []);
+      card.remove(); pendingPlan = null; setInputLocked(false);
+    });
+    card.querySelector(".af-btn-no").addEventListener("click", function() {
+      card.remove(); pendingPlan = null;
+      addMsg("agent", "Alright, cancelled. What else can I help you with?");
+      setInputLocked(false);
+    });
+  }
+
+  function setInputLocked(locked) {
+    isProcessing = locked;
+    document.getElementById("af-input").disabled = locked;
+    document.getElementById("af-send").disabled  = locked;
+    document.getElementById("af-mic").disabled   = locked;
+  }
+
+  // ── File select card ─────────────────────────────────
+  // Renders a list of library files for the user to pick from.
+  // On click, sends the filename back as a user message so the AI reads it.
+  function showFileSelectCard(prompt, files) {
+    const msgs = document.getElementById("af-messages");
+    const card = document.createElement("div");
+
+    // ── IMPORTANT: persist the agent's prompt into conversationHistory ──────
+    // Without this, the user's file-click arrives with two consecutive user
+    // turns and no assistant turn in between.  Anthropic rejects that; other
+    // providers silently get confused and return an empty reply ("Done.").
+    conversationHistory.push({
+      type: "agent",
+      html: prompt || "Which file should I use to answer your question?",
+      time: Date.now()
+    });
+    card.className = "af-file-select-card";
+
+    const FILE_ICONS = { csv:"📊", xlsx:"📊", xls:"📊", pdf:"📄", txt:"📋", md:"📋", docx:"📝", pptx:"📑", json:"🗂️" };
+    function fIcon(name) {
+      const ext = (name.split(".").pop() || "").toLowerCase();
+      return FILE_ICONS[ext] || "📁";
+    }
+
+    const optionsHtml = files.map(f =>
+      `<button class="af-fsc-option" data-filename="${escHtml(f)}">` +
+        `<span class="af-fsc-option-icon">${fIcon(f)}</span>` +
+        `<span>${escHtml(f)}</span>` +
+      `</button>`
+    ).join("");
+
+    card.innerHTML =
+      `<div class="af-fsc-header">📚 Choose a reference file</div>` +
+      `<div class="af-fsc-prompt">${escHtml(prompt || "Which file should I use to answer your question?")}</div>` +
+      `<div class="af-fsc-list">${optionsHtml}</div>` +
+      `<button class="af-fsc-cancel">Cancel</button>`;
+
+    msgs.appendChild(card);
+    setTimeout(() => card.scrollIntoView({ behavior: "smooth", block: "nearest" }), 60);
+    setInputLocked(true);
+
+    card.querySelectorAll(".af-fsc-option").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const chosen = btn.getAttribute("data-filename");
+        card.remove();
+        setInputLocked(false);
+        sendMessage(chosen);
+      });
+    });
+
+    card.querySelector(".af-fsc-cancel").addEventListener("click", () => {
+      card.remove();
+      addMsg("agent", "No problem. Let me know if you need anything else.");
+      setInputLocked(false);
+    });
+  }
+
+  // ── Send message ──────────────────────────────────────
+  async function sendMessage(message) {
+
+  // ── Offline guard — queue instead of failing ─────────
+  if (networkStatus === "offline") {
+    offlineQueue.push(message);
+    addMsg("warning", "📮 You're offline — your message has been queued and will send automatically when you reconnect.", false);
+    return;
+  }
+
+  setInputLocked(true);
+
+  // 1. Snapshot and clear current attachments
+  const currentAttachments = [...attachments];
+  attachments = [];
+  renderTray();
+
+  // 2. Categorize attachments
+  const imageAttachments = currentAttachments.filter(a => a.type.startsWith("image/"));
+  const docAttachments = currentAttachments.filter(a => !a.type.startsWith("image/"));
+
+  // 3. Build UI for the user's message bubble
+  const thumbsHtml = renderAttachmentThumbs(currentAttachments);
+  addMsg("user", message + thumbsHtml);
+
+  const thinking = addMsg("thinking", "Thinking...", false);
+
+  try {
+    // 4. Upload Documents to the server workspace first
+    // This allows the AI to "see" them via list_files and read_file tools
+    if (docAttachments.length > 0) {
+      const formData = new FormData();
+      for (const doc of docAttachments) {
+        // Convert the base64 dataUrl back to a Blob for a standard multipart upload
+        const response = await fetch(doc.dataUrl);
+        const blob = await response.blob();
+        formData.append("files", blob, doc.name);
+      }
+
+      await fetchWithRetry(BACKEND_URL + "/api/agent/upload", {
+        method: "POST",
+        headers: { 
+          ...authHeaders() 
+        },
+        body: formData
+      }, { timeout: adaptiveTimeout(30000), retries: 1 });
+    }
+
+    // Adaptive history — send fewer turns on slow connections to reduce payload
+    const historyLimit = adaptiveHistoryLimit();
+    const historyForAI = conversationHistory.slice(-historyLimit).map(m => ({
+      role: m.type === "user" ? "user" : "assistant",
+      content: m.html.replace(/<[^>]+>/g, "").slice(0, 2000)
+    }));
+
+    // 5. Capture current page context for the AI
+    const pageContext = scanPage();
+
+    // 6. Send the message payload with retry + adaptive timeout
+    //    AI responses are slow by nature; give 60 s on good, 120 s on slow link.
+    const res = await fetchWithRetry(BACKEND_URL + "/api/agent/message", {
+      method: "POST",
+      headers: { 
+        ...authHeaders(), 
+        "Content-Type": "application/json", 
+        "ngrok-skip-browser-warning": "true",
+        "x-connection-quality": networkStatus   // hint for server-side adaptation
+      },
+     body: JSON.stringify({
+        message: message,
+        pageContext,
+        history: historyForAI,
+        device: deviceInfo,   // ← backend uses deviceInfo.deviceId to scope workspace files
+        userRole: USER_ROLE || undefined,
+        // Only images go in the body for the Vision path; docs are already in the workspace
+        attachments: imageAttachments.length > 0 ? imageAttachments.map(a => ({
+          name: a.name,
+          type: a.type,
+          dataUrl: a.dataUrl
+        })) : undefined
+      })
+    }, { timeout: adaptiveTimeout(60000), retries: 1, backoff: 2000 });
+
+    thinking.remove();
+    if (!res.ok) throw new Error("Backend error " + res.status);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || "Unknown error");
+
+    // ── Robust JSON extractor: mirrors backend extractJSON logic ─────────
+    // Finds and returns the first complete JSON object inside any string,
+    // even if the model added a preamble, trailing text, or markdown fences.
+    function extractFirstJSON(str) {
+      const raw   = (str || "").replace(/```json|```/g, "").trim();
+      const start = raw.indexOf("{");
+      if (start === -1) throw new Error("No JSON");
+      let depth = 0, inStr = false, esc = false, end = -1;
+      for (let i = start; i < raw.length; i++) {
+        const c = raw[i];
+        if (esc)        { esc = false; continue; }
+        if (c === "\\") { esc = true;  continue; }
+        if (c === '"')  { inStr = !inStr; continue; }
+        if (inStr)      continue;
+        if (c === "{")  depth++;
+        else if (c === "}") { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end === -1) throw new Error("Unbalanced");
+      return JSON.parse(raw.slice(start, end + 1).replace(/,(\s*[}\]])/g, "$1"));
+    }
+
+    // ── tryReparse: handles all the ways the response can go wrong ───────
+    // 1. Response is already a correctly-typed object → pass through
+    // 2. Response is a string (double-serialised) → extract JSON from it
+    // 3. Response is {type:"chat", reply: "<json string>"} → extract from reply
+    // 4. Response has no type / unexpected type → try to extract from reply
+    function tryReparse(r) {
+      // Already a known non-chat typed response — return as-is
+      if (r && typeof r === "object" && r.type && r.type !== "chat") return r;
+
+      // r is a raw string (backend accidentally stringified the object)
+      if (typeof r === "string") {
+        try {
+          const parsed = extractFirstJSON(r);
+          if (parsed && parsed.type) return parsed;
+        } catch {}
+        return { type: "chat", reply: r };
+      }
+
+      // r.reply may contain a raw JSON string (extractJSON failed on backend)
+      const replyStr = (r && r.reply) ? String(r.reply) : "";
+      if (replyStr.includes("{")) {
+        try {
+          const inner = extractFirstJSON(replyStr);
+          if (inner && inner.type && inner.type !== "chat") return inner;
+        } catch {}
+      }
+
+      return r || { type: "chat", reply: "Done." };
+    }
+
+    const response = tryReparse(data.response);
+
+    if (response.type === "chat") {
+      // Guard: never render raw JSON as a chat bubble
+      const replyText = response.reply || "";
+      if (replyText.trimStart().startsWith("{")) {
+        try {
+          const rescued = extractFirstJSON(replyText);
+          if (rescued && rescued.type && rescued.type !== "chat") {
+            if (rescued.type === "task" && rescued.plan?.actions?.length > 0) {
+              rescued.plan.originalCommand = message;
+              showConfirmCard(rescued.reply, rescued.plan);
+            } else if (rescued.type === "file_select") {
+              showFileSelectCard(rescued.reply, rescued.files || []);
+            } else {
+              addMsg("agent", renderAgentReply(rescued.reply || "Done.", rescued.suggestions, message));
+            }
+            if (rescued.type !== "file_select") setInputLocked(false);
+            return;
+          }
+        } catch {}
+      }
+      addMsg("agent", renderAgentReply(replyText || "Done.", response.suggestions, message));
+    } else if (response.type === "file_select") {
+      showFileSelectCard(response.reply, response.files || []);
+    } else if (response.type === "walkthrough") {
+      if (MVP_FEATURES.walkthroughMode) {
+        showWalkthroughCard(response.reply, response.steps || []);
+      } else {
+        // MVP scope: Guided Walkthrough is gated off by default. Fall back
+        // to a plain reply so the response isn't silently dropped.
+        addMsg("agent", renderAgentReply(response.reply || "Done.", null, message));
+      }
+    } else if (response.type === "task") {
+      if (response.plan?.actions?.length > 0) {
+        response.plan.originalCommand = message;
+        showConfirmCard(response.reply, response.plan);
+      } else {
+        addMsg("agent", renderAgentReply(response.reply || "Done.", response.suggestions, message));
+      }
+    } else if (response.type === "file_result") {
+      let fileReply = response.reply || "Done.";
+      try {
+        const p = extractFirstJSON(fileReply);
+        if (p?.reply) fileReply = p.reply;
+      } catch {}
+      showFileResult(response.steps || [], fileReply, response.downloadables || []);
+    } else {
+      addMsg("agent", renderAgentReply(response.reply || "Done.", response.suggestions, message));
+    }
+
+    // file_select manages its own lock — only unlock for other response types
+    if (response.type !== "file_select") setInputLocked(false);
+
+  } catch (err) {
+    if (thinking) thinking.remove();
+    // Distinguish timeout / offline errors from general backend errors
+    if (err.name === "AbortError") {
+      addMsg("error", "⏱️ The request timed out. Your connection may be slow — please try again.");
+    } else if (!navigator.onLine) {
+      offlineQueue.push(message);
+      addMsg("warning", "📮 You went offline mid-request. Message queued — it'll send when you reconnect.");
+      updateNetworkStatus();
+    } else {
+      addMsg("error", "⚠️ Something went wrong. Check that the server is running.");
+    }
+    console.error("Liontech Support Bot error:", err);
+    setInputLocked(false);
+  }
+}
+
+  // ── Send handlers ─────────────────────────────────────
+  function handleSend() {
+    if (isProcessing) return;
+    const input = document.getElementById("af-input");
+    const text  = input.value.trim();
+    
+    // --- Send structured page scan to the knowledge base ---
+    if (text === "/learn") {
+      input.value = "";
+      addMsg("agent", "📚 Scanning page for the knowledge base...");
+
+      const pageData = scanPage(); // already fully parsed by the live DOM
+
+      fetchWithRetry(BACKEND_URL + "/api/agent/learn-page", {
+        method: "POST",
+        headers: { ...authHeaders({"Content-Type":"application/json"}) },
+        body: JSON.stringify({
+          pageData,
+          url:      window.location.href,
+          pageText: document.body.innerText.slice(0, 1000)
+        })
+      }, { timeout: adaptiveTimeout(15000), retries: 1 })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) addMsg("success", `✅ Page "<strong>${pageData.pageTitle}</strong>" saved to knowledge base! The AI now knows its structure.`);
+        else addMsg("error", "Failed to save page: " + (data.error || "unknown error"));
+      })
+      .catch(() => addMsg("error", "⚠️ Could not connect to server."));
+      return;
+    }
+    // ---------------------------------------------------------
+
+
+
+    if (!text && attachments.length === 0) return;
+    const msg = text || (attachments.length > 0 ? "I've attached " + attachments.length + " file(s). Please review." : "");
+    input.value = "";
+    sendMessage(msg);
+  }
+
+  document.getElementById("af-send").addEventListener("click",   e => { e.preventDefault(); handleSend(); });
+  document.getElementById("af-input").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); handleSend(); } });
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // ════════════════════════════════════════════════════════
+  // ── NETWORK RESILIENCE LAYER ──────────────────────────
+  // fetchWithTimeout  — aborts the request after `ms` milliseconds.
+  // fetchWithRetry    — retries on network failure with exponential backoff.
+  // Adaptive timeouts — shorter for status checks, longer for AI replies.
+  // ════════════════════════════════════════════════════════
+
+  /**
+   * Wraps fetch() with an AbortController-based timeout.
+   * @param {string}  url
+   * @param {object}  options  – standard fetch options
+   * @param {number}  ms       – timeout in milliseconds (default 20 s)
+   */
+  function fetchWithTimeout(url, options, ms = 20000) {
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    return fetch(url, { ...options, signal: ctrl.signal })
+      .finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * fetchWithTimeout + automatic retry on network errors.
+   * @param {string}  url
+   * @param {object}  options
+   * @param {object}  cfg      – { timeout, retries, backoff }
+   */
+  async function fetchWithRetry(url, options, { timeout = 20000, retries = 2, backoff = 1500 } = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt > 0) {
+        await sleep(backoff * attempt);
+      }
+      try {
+        const res = await fetchWithTimeout(url, options, timeout);
+        return res;
+      } catch (err) {
+        lastErr = err;
+        // If the request was explicitly aborted (timeout) don't retry —
+        // the next attempt would also time out and just waste user time.
+        if (err.name === "AbortError") break;
+      }
+    }
+    throw lastErr;
+  }
+
+  // ── Network quality detection ─────────────────────────
+  /**
+   * Returns 'offline' | 'slow' | 'ok' based on browser APIs.
+   * Uses navigator.connection (Network Information API) where available.
+   */
+  function detectNetworkQuality() {
+    if (!navigator.onLine) return "offline";
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (conn) {
+      if (conn.saveData)                          return "slow";
+      if (conn.effectiveType === "2g")             return "slow";
+      if (conn.effectiveType === "slow-2g")        return "slow";
+      if (conn.downlink !== undefined && conn.downlink < 0.5) return "slow";
+    }
+    return "ok";
+  }
+
+  /**
+   * Returns a trimmed timeout in ms tuned to the current connection quality.
+   * 'ok'      → use the passed-in default
+   * 'slow'    → 2× default (more patience)
+   * 'offline' → 8 s (fail fast so error message shows quickly)
+   */
+  function adaptiveTimeout(defaultMs = 20000) {
+    if (networkStatus === "offline") return 8000;
+    if (networkStatus === "slow")    return defaultMs * 2;
+    return defaultMs;
+  }
+
+  /**
+   * Returns the number of conversation turns to include in the AI payload.
+   * Reduces context on slow links to shrink the request body.
+   */
+  function adaptiveHistoryLimit() {
+    if (networkStatus === "slow") return 12;
+    return 40;
+  }
+
+  // ── Update the visual status dot & label ─────────────
+  function updateStatusDot(status) {
+    const dot   = document.getElementById("af-status-dot");
+    const label = document.getElementById("af-status-label");
+    if (!dot || !label) return;
+    // bot-offline overrides network status visually
+    if (!botActive) {
+      dot.className     = "af-dot bot-offline";
+      label.textContent = "Offline";
+      return;
+    }
+    dot.className   = "af-dot" + (status !== "ok" ? " " + status : "");
+    label.textContent = status === "offline" ? "Offline"
+                      : status === "slow"    ? "Slow"
+                      : "Live";
+  }
+
+  // ── Show / hide bot-offline banner ───────────────────
+  function setBotOfflineBanner(show) {
+    const banner = document.getElementById("af-bot-offline-banner");
+    if (!banner) return;
+    banner.className = show ? "visible" : "";
+    banner.style.display = show ? "flex" : "none";
+  }
+
+  // ── Show / hide the network warning banner ────────────
+  function showNetworkBanner(level, message) {
+    const banner = document.getElementById("af-net-banner");
+    const icon   = document.getElementById("af-nb-icon");
+    const msg    = document.getElementById("af-nb-msg");
+    if (!banner) return;
+    banner.className = "visible " + level;
+    icon.innerHTML = level === "offline" ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+    msg.textContent  = message;
+    banner.style.display = "flex";
+  }
+
+  function hideNetworkBanner() {
+    const banner = document.getElementById("af-net-banner");
+    if (banner) { banner.className = ""; banner.style.display = "none"; }
+  }
+
+  // ── Central network-status update ────────────────────
+  function updateNetworkStatus() {
+    const quality = detectNetworkQuality();
+    const changed = quality !== networkStatus;
+    networkStatus = quality;
+    updateStatusDot(quality);
+
+    if (quality === "offline") {
+      showNetworkBanner("offline", "You are offline — messages will be queued and sent when you reconnect.");
+    } else if (quality === "slow") {
+      showNetworkBanner("slow", "Slow connection detected — responses may take a bit longer than usual.");
+    } else {
+      hideNetworkBanner();
+    }
+
+    return changed;
+  }
+
+  // ── Drain offline queue when connection returns ───────
+  async function drainOfflineQueue() {
+    if (offlineQueue.length === 0 || networkStatus !== "ok") return;
+    const queued    = offlineQueue.splice(0);  // take all, clear the array
+    const count     = queued.length;
+    addMsg("agent", `📶 Back online — sending ${count} queued message${count > 1 ? "s" : ""}…`, false);
+    for (const msg of queued) {
+      await sleep(400);
+      await sendMessage(msg);
+    }
+  }
+
+  // ── Wire up browser online / offline events ───────────
+  window.addEventListener("online",  () => {
+    updateNetworkStatus();
+    addMsg("agent", "Connection restored.", false);
+    drainOfflineQueue();
+  });
+  window.addEventListener("offline", () => {
+    updateNetworkStatus();
+    addMsg("warning", "You've gone offline. Your next message will be queued.", false);
+  });
+
+  // Also react to connection-quality changes (Chrome/Android)
+  const _conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (_conn) {
+    _conn.addEventListener("change", () => updateNetworkStatus());
+  }
+
+  // Run once on load
+  updateNetworkStatus();
+
+  // ── Retry button in the banner ────────────────────────
+  document.getElementById("af-nb-retry").addEventListener("click", () => {
+    updateNetworkStatus();
+    if (networkStatus !== "offline") {
+      drainOfflineQueue();
+    }
+  });
+
+  // ── Init ──────────────────────────────────────────────
+  async function init() {
+    try {
+      // ── Auth gate — check for stored JWT first ─────────
+      const stored = loadAuth();
+      if (stored?.token && !isTokenExpired(stored.token)) {
+        widgetToken = stored.token;
+        widgetUser  = stored.user;
+        widgetOrg   = stored.org;
+        setUserChip(stored.user);
+        hideAuthScreen();
+      } else {
+        clearAuth();
+        showAuthScreen("login");
+        return;   // init() will be called again by onAuthSuccess()
+      }
+
+      // ── One-time stale cache bust ──────────────────────
+      // If any previously-crawled pages were stored with 0 buttons + 0 inputs
+      // (i.e., the old fetch+DOMParser approach produced empty data), wipe those
+      // entries from both the learn cache and crawl record so the iframe crawler
+      // picks them up again immediately on this load.
+      (function bustEmptyLearnCache() {
+        try {
+          const lc      = getLearnCache();
+          const changed = Object.keys(lc).filter(url => /^0:0:/.test(lc[url]?.fp || ""));
+          if (!changed.length) return;
+          changed.forEach(url => delete lc[url]);
+          setLearnCache(lc);
+          const raw = localStorage.getItem(CRAWL_CACHE_KEY);
+          if (raw) {
+            const cr = JSON.parse(raw);
+            changed.forEach(url => delete cr[url]);
+            localStorage.setItem(CRAWL_CACHE_KEY, JSON.stringify(cr));
+          }
+        } catch {}
+      }());
+      const res  = await fetchWithRetry(BACKEND_URL + "/api/agent/status", {
+        headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" }
+      }, { timeout: adaptiveTimeout(10000), retries: 3, backoff: 2000 });
+      const data = await res.json();
+      if (!data.success) {
+        clearMessages();
+        addMsg("error", "⚠️ " + (data.error || "Could not connect."), false);
+        return;
+      }
+      clientInfo = data.client;
+      document.getElementById("af-client-name").textContent = clientInfo.name;
+
+      // ── Bot live/offline state ────────────────────────
+      botActive = data.client.botActive !== false;
+      updateStatusDot(networkStatus);
+      setBotOfflineBanner(!botActive);
+      setInputLocked(!botActive);
+
+      const session = loadSession();
+      if (session?.history?.length > 0) {
+        conversationHistory = session.history;
+        restoreMessages();
+        const note = document.createElement("div");
+        note.style.cssText = "text-align:center;font-size:11px;color:#bbb;padding:4px 0;";
+        note.textContent = "— now on: " + document.title + " —";
+        document.getElementById("af-messages").appendChild(note);
+        document.getElementById("af-messages").scrollTop = 999999;
+      } else {
+        clearMessages();
+        addMsg("agent",
+          `Hello! I'm your AI assistant for <strong>${clientInfo.name}</strong>.<br><br>` +
+          `I can see your page and understand natural language. You can also <strong>attach files or images</strong> using the attachment button` +
+          (MVP_FEATURES.voiceNotes ? `, or <strong>record a voice note</strong> with the mic button — you'll see a preview to edit before it sends.` : `.`) +
+          `<br><br>` +
+          `<em>What would you like me to handle?</em>`
+        );
+      }
+
+      // Only unlock input if bot is active
+      if (botActive !== false) setInputLocked(false);
+
+      // ── Resume a cross-page task if one was in flight ──
+      const continuation = loadPendingContinuation();
+      if (continuation) {
+        clearPendingContinuation();
+        // Give the new page's JS a full moment to finish rendering before we scan it
+        await sleep(1400);
+        addMsg("agent",
+          `Resuming task on <strong>${escHtml(document.title)}</strong>…`
+        );
+        await sleep(300);
+        pendingPlan = { originalCommand: continuation.originalCommand, taskType: continuation.taskType };
+        await resumeContinuation(continuation);
+        pendingPlan = null;
+      }
+
+      // Silently learn this page in the background
+      autoLearnPage();
+
+      // Crawl all other linked same-origin pages via hidden iframes —
+      // MVP scope: OFF by default. Only runs if this client's admin has
+      // explicitly opted in (Client.siteCrawlerEnabled), and even then
+      // skips on slow/offline connections to avoid hammering a bad link.
+      // See routes/agent.js's /status endpoint for where this flag comes from.
+      if (networkStatus === "ok" && clientInfo?.siteCrawlerEnabled === true) {
+        crawlAndLearnSite();
+      }
+
+    } catch (err) {
+      clearMessages();
+      if (err.name === "AbortError" || !navigator.onLine) {
+        addMsg("error", "Could not connect — please check your internet connection and try again.", false);
+        updateNetworkStatus();
+      } else {
+        addMsg("error", "⚠️ Could not connect to Liontech Support Bot backend.", false);
+      }
+      console.error("Liontech Support Bot init:", err);
+    }
+  }
+
+  // ── Cross-page task resume ────────────────────────────
+  // Called on the NEW page after a navigate action.
+  // Re-asks the AI with the original intent + fresh page scan so it can
+  // produce a new action plan with valid element IDs for this page.
+  async function resumeContinuation(cont) {
+    const completedPart = cont.stepsCompleted?.length
+      ? `Steps already completed: ${cont.stepsCompleted.join('; ')}. `
+      : '';
+
+    const remainingPart = cont.stepsRemaining?.length
+      ? cont.stepsRemaining.map(s => s.description).filter(Boolean).join(', ')
+      : cont.originalCommand;
+
+    // This message is sent to the AI but not shown to the user as a bubble
+    const resumeMsg =
+      `[CONTINUATION] Original task: "${cont.originalCommand}". ` +
+      `${completedPart}` +
+      `Now on a new page — please continue with: ${remainingPart}.`;
+
+    setInputLocked(true);
+    const thinking = addMsg("thinking", "Replanning for this page…", false);
+
+    try {
+      const pageContext    = scanPage();
+      const historyForAI  = conversationHistory.slice(-16).map(m => ({
+        role:    m.type === "user" ? "user" : "assistant",
+        content: m.html.replace(/<[^>]+>/g, "").slice(0, 400)
+      }));
+
+      const res = await fetchWithRetry(BACKEND_URL + "/api/agent/message", {
+        method: "POST",
+        headers: {
+          ...authHeaders(),
+          "Content-Type": "application/json",
+          "ngrok-skip-browser-warning": "true"
+        },
+        body: JSON.stringify({
+          message:        resumeMsg,
+          pageContext,
+          history:        historyForAI,
+          isContinuation: true
+        })
+      }, { timeout: adaptiveTimeout(60000), retries: 1, backoff: 2000 });
+
+      thinking.remove();
+      if (!res.ok) throw new Error("Backend error " + res.status);
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || "Unknown error");
+
+      const response = data.response;
+
+      if (response.type === "task" && response.plan?.actions?.length > 0) {
+        // Auto-execute — the user already confirmed this task on the previous page.
+        // Show a brief one-line summary so they can see what's happening, then run it.
+        response.plan.originalCommand = cont.originalCommand;
+        const summary = response.reply?.split("\n")[0] || "Executing next steps…";
+        addMsg("agent", "▶ " + escHtml(summary));
+        await sleep(350);
+        await executeActions(response.plan.actions);
+      } else if (response.type === "chat") {
+        addMsg("agent", renderAgentReply(response.reply, response.suggestions));
+      } else {
+        addMsg("agent", renderAgentReply(response.reply || "Done.", response.suggestions));
+      }
+
+    } catch (err) {
+      if (thinking.parentNode) thinking.remove();
+      if (err.name === "AbortError") {
+        addMsg("error", "⏱️ The continuation request timed out. Please try again.");
+      } else {
+        addMsg("error", "⚠️ Could not resume the task on this page. Please try again.");
+      }
+      console.error("Continuation resume error:", err);
+    } finally {
+      setInputLocked(false);
+    }
+  }
+
+  // ── Cross-page task continuation ─────────────────────
+  const PENDING_KEY = "af_pending_" + API_KEY;
+  const PENDING_TTL = 2 * 60 * 1000; // 2 minutes — enough for any page load
+
+  function savePendingContinuation(data) {
+    try { localStorage.setItem(PENDING_KEY, JSON.stringify({ ...data, savedAt: Date.now() })); }
+    catch {}
+  }
+
+  function loadPendingContinuation() {
+    try {
+      const raw = localStorage.getItem(PENDING_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (Date.now() - data.savedAt > PENDING_TTL) {
+        localStorage.removeItem(PENDING_KEY);
+        return null;
+      }
+      return data;
+    } catch { return null; }
+  }
+
+  function clearPendingContinuation() {
+    try { localStorage.removeItem(PENDING_KEY); } catch {}
+  }
+
+  // ── Auto-learn on page load ───────────────────────────
+  // Silently sends scanPage() data to the knowledge base.
+  // Uses localStorage to skip pages that haven't changed —
+  // keyed by URL + a lightweight fingerprint (button + input count).
+  const LEARN_CACHE_KEY = "af_learned_" + API_KEY;
+  const LEARN_TTL_MS    = 7 * 24 * 60 * 60 * 1000; // re-learn after 7 days
+
+  function getLearnCache() {
+    try { return JSON.parse(localStorage.getItem(LEARN_CACHE_KEY) || "{}"); }
+    catch { return {}; }
+  }
+
+  function setLearnCache(cache) {
+    try { localStorage.setItem(LEARN_CACHE_KEY, JSON.stringify(cache)); }
+    catch {}
+  }
+
+  async function autoLearnPage() {
+    // Don't burn bandwidth learning pages on a bad connection
+    if (networkStatus !== "ok") return;
+    try {
+      const pageData    = scanPage();
+      const url         = window.location.href;
+      const fingerprint = pageData.buttons.length + ":" + pageData.inputs.length + ":" + pageData.links.length;
+
+      const cache  = getLearnCache();
+      const cached = cache[url];
+      const now    = Date.now();
+
+      // Skip if same fingerprint seen within TTL
+      if (cached && cached.fp === fingerprint && (now - cached.ts) < LEARN_TTL_MS) return;
+
+      await fetchWithTimeout(BACKEND_URL + "/api/agent/learn-page", {
+        method:  "POST",
+        headers: { ...authHeaders({"Content-Type":"application/json"}) },
+        body:    JSON.stringify({
+          pageData,
+          url,
+          pageText: document.body.innerText.slice(0, 1000)
+        })
+      }, 15000);
+
+      // Update cache entry for this URL
+      cache[url] = { fp: fingerprint, ts: now };
+      // Prune cache to 50 URLs max to avoid bloating localStorage
+      const keys = Object.keys(cache);
+      if (keys.length > 50) {
+        const oldest = keys.sort((a, b) => cache[a].ts - cache[b].ts).slice(0, keys.length - 50);
+        oldest.forEach(k => delete cache[k]);
+      }
+      setLearnCache(cache);
+
+    } catch (e) {
+      // Completely silent — auto-learn should never affect the user experience
+    }
+  }
+
+  // ── Background site crawler (iframe-based) ────────────
+  //
+  // WHY IFRAMES, NOT fetch+DOMParser:
+  //   fetch() + DOMParser only parses raw static HTML — JavaScript never runs,
+  //   so dynamically-rendered buttons and inputs are invisible.
+  //   A hidden same-origin iframe loads the page in a real browser context:
+  //   scripts execute, frameworks render, and contentDocument reflects the live DOM
+  //   — exactly what scanPage() sees when a user visits manually.
+  //
+  // Runs once per week (CRAWL_TTL_MS). On every load it checks whether any
+  // previously-crawled page came back empty (0 btn + 0 fields) and re-queues those,
+  // so a stale bad-data entry never stays forever.
+  const CRAWL_CACHE_KEY = "af_crawled_" + API_KEY;
+  const CRAWL_TTL_MS    = 7 * 24 * 60 * 60 * 1000; // full re-crawl after 7 days
+  const CRAWL_MAX_PAGES = 30;                        // hard cap per run
+  const CRAWL_DELAY_MS  = 1200;                      // ms between iframes (let each page settle)
+  const IFRAME_LOAD_MS  = 3000;                      // ms to wait after onload for JS to render
+
+  // Collects all unique same-origin page URLs linked from the current live page.
+  function collectInternalLinks() {
+    const origin = window.location.origin;
+    const seen   = new Set([window.location.href]);
+    const urls   = [];
+    document.querySelectorAll("a[href]").forEach(a => {
+      try {
+        const resolved = new URL(a.getAttribute("href"), window.location.href).href;
+        if (
+          resolved.startsWith(origin) &&
+          !resolved.includes("#") &&
+          !/\.(pdf|zip|png|jpg|jpeg|gif|svg|csv|xlsx|docx|mp4|mp3)(\?|$)/i.test(resolved) &&
+          !seen.has(resolved)
+        ) {
+          seen.add(resolved);
+          urls.push(resolved);
+        }
+      } catch {}
+    });
+    return urls.slice(0, CRAWL_MAX_PAGES);
+  }
+
+  // Loads a same-origin URL in a tiny hidden iframe, waits for JS to render,
+  // then scans and returns the live contentDocument data.
+  // Returns null on timeout or cross-origin error.
+  function crawlPageWithIframe(url) {
+    return new Promise(resolve => {
+      let done = false;
+      const finish = result => {
+        if (done) return;
+        done = true;
+        try { iframe.remove(); } catch {}
+        resolve(result);
+      };
+
+      const iframe = document.createElement("iframe");
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.style.cssText = [
+        "position:fixed", "top:-9999px", "left:-9999px",
+        "width:1px", "height:1px", "opacity:0",
+        "pointer-events:none", "border:none", "z-index:-1"
+      ].join(";");
+
+      // Hard timeout — give up after 12 s total
+      const hardTimer = setTimeout(() => finish(null), 12000);
+
+      iframe.onload = () => {
+        // Wait IFRAME_LOAD_MS after onload so in-page JS (React, Vue, etc.) can render
+        setTimeout(() => {
+          clearTimeout(hardTimer);
+          try {
+            const doc = iframe.contentDocument || iframe.contentWindow.document;
+            if (!doc || !doc.body) return finish(null);
+
+            // Re-use the same extraction logic as scanPage(), but on the iframe doc
+            let ctr = 0;
+            const nid = () => "afc-" + (++ctr);
+
+            const buttons = Array.from(
+              doc.querySelectorAll("button, input[type=button], input[type=submit], [role=button], a.btn, a.button")
+            ).slice(0, 40).map(el => ({
+              afId: nid(), id: el.id || "",
+              text: (el.innerText || el.value || el.textContent || "").trim().slice(0, 80),
+              disabled: el.disabled || el.getAttribute("aria-disabled") === "true"
+            })).filter(b => b.text);
+
+            const inputs = Array.from(
+              doc.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]), select, textarea")
+            ).slice(0, 40).map(el => {
+              let label = "";
+              if (el.id) {
+                const lbl = doc.querySelector(`label[for="${el.id}"]`);
+                if (lbl) label = lbl.textContent.trim();
+              }
+              if (!label) label = el.getAttribute("aria-label") || el.placeholder || el.name || "";
+              return { afId: nid(), id: el.id || "", type: el.type || el.tagName.toLowerCase(), label: label.slice(0, 80), value: "" };
+            });
+
+            const links = Array.from(doc.querySelectorAll("a[href]"))
+              .slice(0, 60)
+              .map(el => ({ afId: nid(), text: (el.textContent || "").trim().slice(0, 60), href: el.getAttribute("href") || "" }))
+              .filter(l => l.text && l.text.length > 1);
+
+            const headings = Array.from(doc.querySelectorAll("h1,h2,h3"))
+              .slice(0, 15).map(el => el.textContent.trim());
+
+            finish({
+              pageData: { pageTitle: doc.title || new URL(url).pathname, url, buttons, inputs, links, headings, tables: [] },
+              pageText: (doc.body.innerText || doc.body.textContent || "").slice(0, 1000)
+            });
+          } catch {
+            finish(null); // cross-origin or other error
+          }
+        }, IFRAME_LOAD_MS);
+      };
+
+      iframe.onerror = () => { clearTimeout(hardTimer); finish(null); };
+
+      document.body.appendChild(iframe);
+      iframe.src = url;
+    });
+  }
+
+  async function crawlAndLearnSite() {
+    // Never crawl on slow or offline connections — iframes + sequential fetches
+    // would either fail silently or waste the user's bandwidth cap.
+    if (networkStatus !== "ok") return;
+    try {
+      const now        = Date.now();
+      const learnCache = getLearnCache();
+
+      // Collect links first — bail early if nothing to do
+      const links = collectInternalLinks();
+      if (!links.length) return;
+
+      // Decide which URLs need crawling:
+      //   (a) never crawled, OR
+      //   (b) TTL expired, OR
+      //   (c) previously crawled but stored with 0 buttons AND 0 inputs (bad empty data)
+      const crawlRaw    = localStorage.getItem(CRAWL_CACHE_KEY);
+      const crawlRecord = crawlRaw ? JSON.parse(crawlRaw) : {};
+
+      const toCrawl = links.filter(url => {
+        const cc = crawlRecord[url];
+        if (!cc) return true;                                    // never crawled
+        if ((now - cc.ts) >= CRAWL_TTL_MS) return true;         // TTL expired
+        const lc = learnCache[url];
+        if (lc && lc.fp === "0:0:0") return true;               // stored empty — retry
+        if (lc && /^0:0:/.test(lc.fp)) return true;             // 0 btn + 0 inputs — retry
+        return false;
+      });
+
+      if (!toCrawl.length) return;
+
+      for (const url of toCrawl) {
+        try {
+          const result = await crawlPageWithIframe(url);
+          if (!result) continue;
+
+          const { pageData, pageText } = result;
+          const fingerprint = pageData.buttons.length + ":" + pageData.inputs.length + ":" + pageData.links.length;
+
+          await fetchWithTimeout(BACKEND_URL + "/api/agent/learn-page", {
+            method:  "POST",
+            headers: { ...authHeaders({"Content-Type":"application/json"}) },
+            body:    JSON.stringify({ pageData, url, pageText })
+          }, 15000);
+
+          // Update learn cache so autoLearnPage skips this URL on the user's next real visit
+          learnCache[url] = { fp: fingerprint, ts: now };
+          setLearnCache(learnCache);
+
+          // Record this crawl attempt
+          crawlRecord[url] = { ts: now };
+          localStorage.setItem(CRAWL_CACHE_KEY, JSON.stringify(crawlRecord));
+
+        } catch {}
+
+        // Stagger iframes — avoids UI jank and backend hammering
+        await new Promise(r => setTimeout(r, CRAWL_DELAY_MS));
+      }
+
+    } catch {
+      // Completely silent — never disrupts the user
+    }
+  }
+
+  // ── Bot status poll (every 30 s) ──────────────────────
+  // Detects when an admin toggles the bot on/off without a page reload.
+  // Uses the same /api/agent/status endpoint as init — lightweight GET, no AI call.
+  async function pollBotStatus() {
+    try {
+      const res  = await fetch(BACKEND_URL + "/api/agent/status", {
+        headers: { ...authHeaders(), "ngrok-skip-browser-warning": "true" },
+        signal:  AbortSignal.timeout(8000)
+      });
+      const data = await res.json();
+      const nowActive = data.success && data.client?.botActive !== false;
+      if (nowActive === botActive) return;   // no change — nothing to do
+
+      botActive = nowActive;
+      updateStatusDot(networkStatus);
+      setBotOfflineBanner(!botActive);
+
+      if (!botActive) {
+        // Bot was just turned OFF
+        setInputLocked(true);
+        addMsg("agent",
+          `<strong>Assistant offline</strong><br>` +
+          `The assistant has been temporarily disabled. Please try again later.`
+        );
+      } else {
+        // Bot was just turned back ON
+        setInputLocked(false);
+        addMsg("agent",
+          `<strong>Assistant back online</strong><br>` +
+          `The assistant is available again. How can I help?`
+        );
+      }
+    } catch {
+      // Silent — network blips don't change botActive state
+    }
+  }
+
+  // Start polling 30 s after init so it doesn't compete with startup requests
+  setTimeout(() => setInterval(pollBotStatus, 30000), 30000);
+
+  init();
+}());
