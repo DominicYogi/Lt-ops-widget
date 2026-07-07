@@ -1,90 +1,84 @@
-# Lt-ops — Liontech Support Bot Platform
+# Lt-ops-widget
 
-This workspace bundles the two repositories that make up the **Liontech Support
-Bot** product: an embeddable AI support widget for ERP-style web apps, and the
-multi-tenant backend + admin platform that powers it.
+The embeddable **chat widget** for Liontech Support Bot — a single
+self-contained script a client organisation drops into their own web app
+(typically an internal ERP or intranet page) to give staff an AI support
+assistant scoped to that organisation's knowledge base and permissions.
 
-| Repository | Path | What it is |
+## Files
+
+| File | Purpose |
+|---|---|
+| `widget.js` | The full, human-readable source of the widget |
+| `widget.min.js` | Minified build for production embedding |
+| `reset-password.html` | Standalone password-reset landing page, linked from reset emails sent by the backend |
+| `liontech.png` | Brand logo asset used in the widget UI |
+| `.gitignore` | Ignores `widget.js` from... *(see note below)* |
+
+> **Note:** this repo's `.gitignore` currently excludes `widget.js` itself.
+> If that's intentional (e.g. the minified build is the tracked deliverable
+> and the readable source is generated or kept elsewhere), no action needed —
+> but if `widget.js` should be version-controlled, double check the
+> `.gitignore` entry.
+
+## Embedding the widget
+
+```html
+<script
+  src="https://your-backend-host/widget.min.js"
+  data-api-key="lts_live_xxxxxxxxxxxxxxxx"
+  data-theme="blue"
+  data-user-role="Accounts Clerk">
+</script>
+```
+
+| Attribute | Required | Purpose |
 |---|---|---|
-| `Lt-support-bot` | [`dom/`](dom/README.md) | Node/Express/MongoDB API, the super-admin dashboards, and everything server-side |
-| `Lt-ops-widget` | [`widget/`](widget/README.md) | The embeddable JS chat widget + password reset page served to end customers |
+| `data-api-key` | **Yes** | The client organisation's API key (see `models/Client.js` in the backend). Without it, the widget shows a visible configuration-error box and does not initialize — there is intentionally no silent fallback to any other key. |
+| `data-theme` | No | One of `blue` (default), `green`, `dark`, `red` |
+| `data-user-role` | No | The logged-in user's role in the host ERP (e.g. `"Accounts Clerk"`), sent with every message so the AI avoids suggesting actions outside that role |
 
-Each folder has its own `git` history (`dom/.git`, `widget/.git`) and its own
-README, so they can be developed and deployed independently even though they
-ship together as one product.
+`BACKEND_URL` inside `widget.js` currently points at the deployed
+`onrender.com` host — changing this is an infrastructure/DNS decision, not a
+simple find-and-replace, so update it deliberately when the backend moves.
 
-## How the pieces fit together
+## What the widget does
 
-```
-                ┌─────────────────────────────────────────┐
-                │        Client's ERP web page             │
-                │  <script src=".../widget.min.js"          │
-                │          data-api-key="lts_live_...">     │
-                └───────────────────┬───────────────────────┘
-                                    │  widget.js (widget/)
-                                    │  chat UI, task engine, file tools
-                                    ▼
-                ┌─────────────────────────────────────────┐
-                │   liontech-support-bot-backend (dom/)     │
-                │   Express API — auth, AI routing,         │
-                │   billing, knowledge base, audit logs     │
-                └───────┬───────────────────┬───────────────┘
-                        │                   │
-                        ▼                   ▼
-                ┌───────────────┐   ┌───────────────────┐
-                │   MongoDB      │   │  Cloudflare R2     │
-                │  (clients,     │   │  (workspace files, │
-                │   users, logs) │   │   knowledge files) │
-                └───────────────┘   └───────────────────┘
-                        ▲
-                        │  same-origin static files
-                ┌───────┴───────────────────────────────┐
-                │   liontech-admin (dom/liontech-admin)   │
-                │   Super-admin dashboard: manage clients,│
-                │   knowledge base, billing, audit logs   │
-                └─────────────────────────────────────────┘
-```
+- Renders a chat panel (resizable, full-screen toggle) that talks to the
+  backend's `/api/agent/*` endpoints for AI chat, file uploads, and task
+  execution.
+- Handles its own staff login/signup/forgot-password flow against
+  `/api/user/*`, storing the resulting JWT in `localStorage`
+  (`af_auth_<apiKey>`).
+- Keeps a searchable local conversation archive (`af_archive_<apiKey>`, most
+  recent 40 sessions) and syncs history to the server for cross-device
+  continuity.
+- Detects basic device/browser/OS info client-side to attach as metadata on
+  audit-logged actions.
+- Ships several **MVP feature flags**, off by default, with the underlying
+  code intentionally left in place rather than deleted:
+  - `commandPalette` — Ctrl+K / Cmd+K quick-command palette
+  - `walkthroughMode` — guided walkthrough step-tracker UI
+  - `voiceNotes` — microphone voice-note recording
+  - `shareConversation` — "copy transcript" button in history
 
-## Product summary
+  Flip these to `true` in `widget.js` (or wire a per-client config, the same
+  way `siteCrawlerEnabled` is wired on the backend) to re-enable.
 
-Liontech Support Bot is a **white-labelled, multi-tenant AI support
-assistant** that a business ("client" / organisation) embeds into its own
-internal web application (typically an older-style ERP or intranet). It:
+## `reset-password.html`
 
-- Answers staff questions about how to use the host application, using a
-  per-client knowledge base (pages, FAQs, documents, terminology).
-- Can execute predictable, scripted actions ("tasks") inside the host page —
-  e.g. approving a request, filling a form — through a deterministic task
-  engine, without needing an LLM call for known workflows.
-- Tracks token usage and cost per client for billing, with configurable
-  monthly caps.
-- Is administered through a separate super-admin dashboard, distinct from the
-  per-organisation staff logins used inside the widget itself.
+A standalone page (not part of the widget bundle) that a user lands on from
+a password-reset email. It submits the new password plus the emailed token
+to `POST /api/user/reset-password` on the backend.
 
-## Live demo
+## Local development
 
-- [Pre-Authorization — MediCare HMO](https://dominicyogi.github.io/Lt-ops-widget/test.html)
+There's no build step for `widget.js` (plain IIFE JavaScript). To test
+changes:
 
-## Repository quick links
-
-- Backend API and business logic → [`dom/liontech-support-bot-backend/README.md`](dom/liontech-support-bot-backend/README.md)
-- Super-admin dashboards (HTML/CSS/JS, no build step) → [`dom/liontech-admin/README.md`](dom/liontech-admin/README.md)
-- Embeddable chat widget → [`widget/README.md`](widget/README.md)
-
-## Getting started (local development)
-
-1. **Backend**: see [`dom/liontech-support-bot-backend/README.md`](dom/liontech-support-bot-backend/README.md)
-   for environment variables and `npm start`.
-2. **Admin dashboards**: served automatically by the backend at `/lt-ops`
-   once it's running — no separate build or server needed.
-3. **Widget**: point a test HTML page at your local backend and load
-   `widget/widget.js` with a valid `data-api-key`; see
-   [`widget/README.md`](widget/README.md).
-
-## Security notes
-
-- Real secrets belong only in `dom/liontech-support-bot-backend/.env`, which
-  is git-ignored. Never commit real API keys, JWT secrets, or database URIs.
-- The `data/` folder inside the backend contains **sample/seed data** for
-  local development, not production data — see
-  [`dom/liontech-support-bot-backend/data/README.md`](dom/liontech-support-bot-backend/data/README.md).
+1. Point `BACKEND_URL` at your local backend instance (or run the backend on
+   the same host it already expects).
+2. Serve a test HTML page that includes `<script src="widget.js"
+   data-api-key="...">` with a valid API key from your local database.
+3. For production, regenerate `widget.min.js` from the updated `widget.js`
+   using your preferred minifier before deploying.
